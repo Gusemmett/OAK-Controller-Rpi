@@ -1,0 +1,28 @@
+[project]
+name = "oak-controller-rpi"
+version = "0.1.0"
+description = "RPi controller and Luxonis OAK camera app development workspace"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-aarch64"]
+
+[dependencies]
+python = "3.11.*"
+numpy = "*"
+
+[pypi-dependencies]
+depthai = "*"
+opencv-python = "*"
+
+[feature.dev.dependencies]
+pytest = "*"
+ruff = "*"
+black = "*"
+mypy = "*"
+
+[tasks]
+lint = "ruff check src camera_apps tests"
+format = "ruff format src camera_apps tests && black src camera_apps tests"
+typecheck = "mypy src"
+test = "pytest -q"
+run:rpi = "python -m oak_controller_rpi"
+run:camera = "python camera_apps/examples/hello_camera.py"
