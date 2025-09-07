@@ -193,10 +193,10 @@ class NativeOAKRecorder:
         
         # Video encoders
         encL = pipeline.create(dai.node.VideoEncoder).build(
-            outL, frameRate=self.fps, profile=dai.VideoEncoderProperties.Profile.H265_MAIN
+            outL, frameRate=self.fps, profile=dai.VideoEncoderProperties.Profile.H264_MAIN
         )
         encR = pipeline.create(dai.node.VideoEncoder).build(
-            outR, frameRate=self.fps, profile=dai.VideoEncoderProperties.Profile.H265_MAIN
+            outR, frameRate=self.fps, profile=dai.VideoEncoderProperties.Profile.H264_MAIN
         )
         
         # Host nodes for saving data
