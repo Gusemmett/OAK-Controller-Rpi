@@ -289,91 +289,85 @@ class NativeOAKRecorder:
         logger.info(f"Calibration data saved to {calibration_path}")
     
     def _dump_calibration_from_running_device(self):
-        """Export calibration from device connected via running pipeline"""
+        """Export calibration using the same schema as experiments/record_oak_stereo.py"""
         if not self._output_dir:
             logger.error("No output directory set for calibration export")
             return
-            
+
         calibration_path = self._output_dir / "calibration.json"
         logger.debug(f"Exporting calibration to: {calibration_path}")
-        
+
         data = {}
-        
         try:
-            # Try to get device from running pipeline
-            logger.debug("Attempting to get device from running pipeline...")
-            
-            # In DepthAI v3, we need to use a different approach for running pipelines
-            # Create a temporary connection to get calibration data
-            logger.debug("Creating temporary device connection for calibration...")
-            with dai.Device() as cal_device:
-                logger.debug("Temporary calibration device connected")
-                
-                cal = cal_device.readCalibration()
-                logger.debug("Calibration data read from device")
-                
-                def get_cam_data(sock):
-                    logger.debug(f"Getting calibration data for socket: {sock}")
-                    # Intrinsics
-                    K = None
-                    if hasattr(cal, "getCameraIntrinsics"):
-                        K = cal.getCameraIntrinsics(sock, self.width, self.height)
-                        logger.debug(f"Got intrinsics matrix for {sock}")
-                    elif hasattr(cal, "getCameraMatrix"):
-                        try:
-                            K = cal.getCameraMatrix(sock, self.width, self.height)
-                            logger.debug(f"Got camera matrix for {sock}")
-                        except Exception:
-                            K = cal.getCameraMatrix(sock)
-                            logger.debug(f"Got camera matrix (fallback) for {sock}")
-                    
-                    # Distortion
-                    dist = None
-                    for name in ("getDistortionCoefficients", "getDistortionCoeffs", "getDistortion"):
-                        if hasattr(cal, name):
-                            dist = getattr(cal, name)(sock)
-                            logger.debug(f"Got distortion coefficients via {name} for {sock}")
-                            break
-                    
-                    fov = cal.getFov(sock) if hasattr(cal, "getFov") else None
-                    if fov:
-                        logger.debug(f"Got FOV for {sock}: {fov}")
-                    
-                    return {
-                        "socket": getattr(sock, "name", str(sock)),
-                        "width": self.width,
-                        "height": self.height,
-                        "intrinsics": K,
-                        "distortion": dist,
-                        "fov_deg": fov,
-                    }
-                
+            w = int(getattr(self, "width", 1280))
+            h = int(getattr(self, "height", 720))
+
+            left_sock = getattr(self, "left_socket", getattr(dai.CameraBoardSocket, "CAM_B", None))
+            right_sock = getattr(self, "right_socket", getattr(dai.CameraBoardSocket, "CAM_C", None))
+            rgb_sock = getattr(self, "rgb_socket", getattr(dai.CameraBoardSocket, "CAM_A", None))
+
+            # Prefer using the running pipeline (matches record_oak behavior), fall back to a direct device
+            logger.debug("Creating device connection for calibration read...")
+            try:
+                if hasattr(self, "_pipeline") and self._pipeline is not None:
+                    device_ctx = dai.Device(self._pipeline)
+                else:
+                    device_ctx = dai.Device()
+            except Exception:
+                # Fallback if pipeline-based construction fails
+                device_ctx = dai.Device()
+
+            with device_ctx as device:
+                logger.debug("Device connected for calibration read")
+                cal = device.readCalibration()
+
+                # Intrinsics
+                K_left = cal.getCameraIntrinsics(left_sock, w, h)
+                K_right = cal.getCameraIntrinsics(right_sock, w, h)
+
+                # Distortion (truncate to first 8 like record_oak)
+                dist_left = cal.getDistortionCoefficients(left_sock)
+                dist_right = cal.getDistortionCoefficients(right_sock)
+
+                # Extrinsics: left->RGB and right->RGB (matches record_oak)
+                L_to_RGB = cal.getCameraExtrinsics(left_sock, rgb_sock)
+                R_to_RGB = cal.getCameraExtrinsics(right_sock, rgb_sock)
+
+                # Also provide left->right 4x4
+                L_to_R = cal.getCameraExtrinsics(left_sock, right_sock)
+
                 data = {
-                    "device_mxid": cal_device.getMxId() if hasattr(cal_device, "getMxId") else None,
-                    "left": get_cam_data(self.left_socket),
-                    "right": get_cam_data(self.right_socket),
+                    "left": {
+                        "socket": getattr(left_sock, "name", str(left_sock)),
+                        "resolution": [w, h],
+                        "intrinsics": K_left,
+                        "distortion": dist_left[:8] if dist_left is not None else None,
+                        "extrinsics": L_to_RGB,
+                    },
+                    "right": {
+                        "socket": getattr(right_sock, "name", str(right_sock)),
+                        "resolution": [w, h],
+                        "intrinsics": K_right,
+                        "distortion": dist_right[:8] if dist_right is not None else None,
+                        "extrinsics": R_to_RGB,
+                    },
+                    "extrinsics_left_to_right": {
+                        "matrix_4x4": L_to_R,
+                    },
                 }
-                
-                logger.debug(f"Device MX ID: {data.get('device_mxid')}")
-                
-                # Extrinsics (left -> right)
-                if hasattr(cal, "getCameraExtrinsics"):
-                    try:
-                        E = cal.getCameraExtrinsics(self.left_socket, self.right_socket)
-                        if E:
-                            R = [row[:3] for row in E[:3]]
-                            t = [E[0][3], E[1][3], E[2][3]]
-                            data["extrinsics_left_to_right"] = {"R": R, "T": t, "matrix_4x4": E}
-                            logger.debug("Successfully extracted extrinsics")
-                    except Exception as e:
-                        logger.debug(f"Could not get extrinsics: {e}")
-                        
+
+                # Device metadata
+                try:
+                    data["device_mxid"] = device.getMxId()
+                except Exception:
+                    pass
+
         except Exception as e:
             error_msg = f"Failed to read calibration from device: {e}"
             logger.error(error_msg)
             logger.exception("Full calibration error details:")
             data = {"error": error_msg}
-        
+
         try:
             with open(calibration_path, "w") as f:
                 json.dump(data, f, indent=2)
