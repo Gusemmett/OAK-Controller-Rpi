@@ -1,9 +1,9 @@
 # To install pre-release depthai and force reinstall, run:
 # pip install --pre depthai --force-reinstall
 
-depthai
 opencv-python
 flask
 boto3
 zeroconf
 aiofiles
+rerun-sdk

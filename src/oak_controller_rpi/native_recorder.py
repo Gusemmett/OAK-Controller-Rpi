@@ -5,9 +5,7 @@ import csv
 import json
 import logging
 import os
-import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 from enum import Enum
@@ -18,11 +16,9 @@ logger = logging.getLogger(__name__)
 
 class RecorderState(Enum):
     STOPPED = "stopped"
-    INITIALIZING = "initializing" 
-    WARMING_UP = "warming_up"
+    INITIALIZING = "initializing"
     READY = "ready"
     RECORDING = "recording"
-    STOPPING = "stopping"
     ERROR = "error"
 
 class VideoSaver(dai.node.HostNode):
@@ -32,7 +28,7 @@ class VideoSaver(dai.node.HostNode):
         self.filename = None
         self._fh = None
 
-    def build(self, *link_args, filename="video.h264"):
+    def build(self, *link_args, filename="video.h265"):
         self.link_args(*link_args)
         self.filename = filename
         return self
@@ -80,165 +76,115 @@ class TsLogger(dai.node.HostNode):
             self._f = None
             self._w = None
 
-class IMUSaver(dai.node.HostNode):
-    """Host node for saving IMU data to CSV"""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.path = None
-        self._w = None
-        self._f = None
-
-    def build(self, *link_args, path="imu.csv"):
-        self.link_args(*link_args)
-        self.path = path
-        return self
-
-    def process(self, imuData):
-        if self._w is None:
-            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            self._f = open(self.path, "w", newline="")
-            self._w = csv.writer(self._f)
-            self._w.writerow(["ts_ns","gyro_x","gyro_y","gyro_z","accel_x","accel_y","accel_z"])
-
-        # Process IMU packets
-        for pkt in imuData.packets:
-            accel = getattr(pkt, "acceleroMeter", None)
-            gyro = getattr(pkt, "gyroscope", None)
-            if accel is None or gyro is None:
-                continue
-
-            # Get timestamp
-            ts_func = getattr(accel, "getTimestampDevice", None) or accel.getTimestamp
-            ts = ts_func()
-            ts_ns = int(ts.total_seconds() * 1e9)
-
-            self._w.writerow([ts_ns, gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z])
-
-    def close(self):
-        if self._f:
-            self._f.close()
-            self._f = None
-            self._w = None
-
 class NativeOAKRecorder:
-    """Native OAK camera recorder with warmup and synchronization capabilities"""
-    
-    def __init__(self, 
+    """Simplified OAK stereo recorder: build, start, stop. No warmup, no IMU."""
+
+    def __init__(self,
                  width: int = 1280,
                  height: int = 720,
-                 fps: float = 25.0,
-                 bitrate_kbps: int = 4000,
-                 left_socket: str = "CAM_B",
-                 right_socket: str = "CAM_C",
-                 imu_rate_hz: int = 200):
-        
+                 fps: float = 30.0,
+                 is_camera_upside_down: bool = True):
+
         self.width = width
         self.height = height
         self.fps = fps
-        self.bitrate_kbps = bitrate_kbps
-        self.left_socket = self._parse_socket(left_socket)
-        self.right_socket = self._parse_socket(right_socket)
-        self.imu_rate_hz = imu_rate_hz
-        
-        # State management
+        # Assign sockets based on orientation. Normal: left=B, right=C. Upside down: swap.
+        if is_camera_upside_down:
+            left_socket_name = "CAM_C"
+            right_socket_name = "CAM_B"
+        else:
+            left_socket_name = "CAM_B"
+            right_socket_name = "CAM_C"
+
+        self.left_socket = self._parse_socket(left_socket_name)
+        self.right_socket = self._parse_socket(right_socket_name)
+        self.is_camera_upside_down = is_camera_upside_down
+
+        # State
         self.state = RecorderState.STOPPED
         self._pipeline: Optional[dai.Pipeline] = None
-        self._savers = {}
-        self._loggers = {}
+        self._savers: Dict[str, Any] = {}
+        self._loggers: Dict[str, Any] = {}
         self._output_dir: Optional[Path] = None
-        self._recording_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        
-        # Performance tracking
-        self._init_start_time: Optional[float] = None
-        self._warmup_start_time: Optional[float] = None
         self._recording_start_time: Optional[float] = None
-        
+
     def _parse_socket(self, name: str) -> dai.CameraBoardSocket:
-        """Parse socket name to CameraBoardSocket enum"""
         try:
             return getattr(dai.CameraBoardSocket, name)
         except AttributeError:
             raise ValueError(f"Invalid socket {name}. Use CAM_A, CAM_B, CAM_C, CAM_D.")
-    
+
     def _build_pipeline(self) -> Tuple[dai.Pipeline, Dict[str, Any]]:
-        """Build the DepthAI pipeline for dual camera recording"""
+        """Build a simple DepthAI pipeline with Sync + Demux + H.264 encoders."""
         logger.info("Building DepthAI pipeline...")
-        
-        pipeline = dai.Pipeline()
-        
-        # Create cameras
-        camL = pipeline.create(dai.node.Camera).build(self.left_socket, sensorFps=self.fps)
-        camR = pipeline.create(dai.node.Camera).build(self.right_socket, sensorFps=self.fps)
-        
-        # Camera outputs
-        outL = camL.requestOutput(
-            (self.width, self.height),
-            type=dai.ImgFrame.Type.NV12,
-            resizeMode=dai.ImgResizeMode.LETTERBOX,
-            fps=self.fps,
+
+        p = dai.Pipeline()
+
+        camL = p.create(dai.node.Camera).build(self.left_socket, sensorFps=self.fps)
+        camR = p.create(dai.node.Camera).build(self.right_socket, sensorFps=self.fps)
+
+        outL = camL.requestOutput((self.width, self.height), type=dai.ImgFrame.Type.RAW8, fps=self.fps)
+        outR = camR.requestOutput((self.width, self.height), type=dai.ImgFrame.Type.RAW8, fps=self.fps)
+
+        # Optionally flip images if the camera is mounted upside down
+        sourceL = outL
+        sourceR = outR
+        if self.is_camera_upside_down:
+            manipL = p.create(dai.node.ImageManip)
+            manipL.initialConfig.addFlipVertical()
+            manipL.initialConfig.addFlipHorizontal()
+            outL.link(manipL.inputImage)
+            sourceL = manipL.out
+
+            manipR = p.create(dai.node.ImageManip)
+            manipR.initialConfig.addFlipVertical()
+            manipR.initialConfig.addFlipHorizontal()
+            outR.link(manipR.inputImage)
+            sourceR = manipR.out
+
+        sync = p.create(dai.node.Sync)
+        sourceL.link(sync.inputs["left"])
+        sourceR.link(sync.inputs["right"])
+
+        demux = p.create(dai.node.MessageDemux)
+        sync.out.link(demux.input)
+
+        encL = p.create(dai.node.VideoEncoder).build(
+            demux.outputs["left"], frameRate=self.fps,
+            profile=dai.VideoEncoderProperties.Profile.H264_MAIN
         )
-        outR = camR.requestOutput(
-            (self.width, self.height),
-            type=dai.ImgFrame.Type.NV12,
-            resizeMode=dai.ImgResizeMode.LETTERBOX,
-            fps=self.fps,
+        encR = p.create(dai.node.VideoEncoder).build(
+            demux.outputs["right"], frameRate=self.fps,
+            profile=dai.VideoEncoderProperties.Profile.H264_MAIN
         )
-        
-        # Hardware synchronization
-        sync = pipeline.create(dai.node.Sync)
-        sync.setRunOnHost(False)
-        outL.link(sync.inputs["left"])
-        outR.link(sync.inputs["right"])
-        
-        # Video encoders
-        encL = pipeline.create(dai.node.VideoEncoder).build(
-            outL, frameRate=self.fps, profile=dai.VideoEncoderProperties.Profile.H264_MAIN
-        )
-        encR = pipeline.create(dai.node.VideoEncoder).build(
-            outR, frameRate=self.fps, profile=dai.VideoEncoderProperties.Profile.H264_MAIN
-        )
-        
-        # Host nodes for saving data
-        saverL = pipeline.create(VideoSaver).build(encL.out)
-        saverR = pipeline.create(VideoSaver).build(encR.out)
-        loggerL = pipeline.create(TsLogger).build(encL.out)
-        loggerR = pipeline.create(TsLogger).build(encR.out)
-        
-        # IMU
-        imu = pipeline.create(dai.node.IMU)
-        imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, self.imu_rate_hz)
-        imu.enableIMUSensor(dai.IMUSensor.GYROSCOPE_RAW, self.imu_rate_hz)
-        imu.setBatchReportThreshold(10)
-        imu.setMaxBatchReports(20)
-        imu_saver = pipeline.create(IMUSaver).build(imu.out)
-        
-        nodes = {
-            'saverL': saverL,
-            'saverR': saverR,
-            'loggerL': loggerL,
-            'loggerR': loggerR,
-            'imu_saver': imu_saver
-        }
-        
-        logger.info("DepthAI pipeline built successfully")
-        return pipeline, nodes
-    
-    def _dump_calibration(self, output_dir: Path):
-        """Export camera calibration data"""
-        calibration_path = output_dir / "calibration.json"
-        data = {}
-        
+
+        saverL = p.create(VideoSaver).build(encL.out)
+        saverR = p.create(VideoSaver).build(encR.out)
+        loggerL = p.create(TsLogger).build(encL.out)
+        loggerR = p.create(TsLogger).build(encR.out)
+
+        nodes = {"saverL": saverL, "saverR": saverR, "loggerL": loggerL, "loggerR": loggerR}
+        logger.info("DepthAI pipeline built")
+        return p, nodes
+
+    def _dump_calibration_from_running_device(self):
+        """Export calibration with intrinsics adjusted for vertical flip."""
+        if not self._output_dir:
+            logger.error("No output directory set for calibration export")
+            return
+
+        calibration_path = self._output_dir / "calibration.json"
+        data: Dict[str, Any] = {}
+
         try:
-            # Temporarily connect to device for calibration
-            logger.debug("Attempting temporary device connection for calibration...")
-            with dai.Device() as temp_device:
-                logger.debug("Temporary device connected successfully")
-                cal = temp_device.readCalibration()
-                
-                def get_cam_data(sock):
+            with dai.Device() as cal_device:
+                cal = cal_device.readCalibration()
+
+                logger.info(cal)
+                logger.info(cal.getStereoRightCameraId())
+
+                def cam_block(sock):
                     # Intrinsics
-                    K = None
                     if hasattr(cal, "getCameraIntrinsics"):
                         K = cal.getCameraIntrinsics(sock, self.width, self.height)
                     elif hasattr(cal, "getCameraMatrix"):
@@ -246,16 +192,19 @@ class NativeOAKRecorder:
                             K = cal.getCameraMatrix(sock, self.width, self.height)
                         except Exception:
                             K = cal.getCameraMatrix(sock)
-                    
+                    else:
+                        K = None
+
                     # Distortion
                     dist = None
                     for name in ("getDistortionCoefficients", "getDistortionCoeffs", "getDistortion"):
                         if hasattr(cal, name):
                             dist = getattr(cal, name)(sock)
                             break
-                    
+
                     fov = cal.getFov(sock) if hasattr(cal, "getFov") else None
-                    return {
+
+                    cam = {
                         "socket": getattr(sock, "name", str(sock)),
                         "width": self.width,
                         "height": self.height,
@@ -263,110 +212,28 @@ class NativeOAKRecorder:
                         "distortion": dist,
                         "fov_deg": fov,
                     }
-                
+
+                    return cam
+
                 data = {
-                    "device_mxid": temp_device.getMxId() if hasattr(temp_device, "getMxId") else None,
-                    "left": get_cam_data(self.left_socket),
-                    "right": get_cam_data(self.right_socket),
+                    "device_mxid": cal_device.getMxId() if hasattr(cal_device, "getMxId") else None,
+                    "right": cam_block(self.left_socket),
+                    "left": cam_block(self.right_socket),
                 }
-                
-                # Extrinsics (left -> right)
+
+                # Extrinsics left->right unchanged
                 if hasattr(cal, "getCameraExtrinsics"):
                     try:
-                        E = cal.getCameraExtrinsics(self.left_socket, self.right_socket)
+                        E = cal.getCameraExtrinsics(self.right_socket, self.left_socket)
                         if E:
                             R = [row[:3] for row in E[:3]]
                             t = [E[0][3], E[1][3], E[2][3]]
                             data["extrinsics_left_to_right"] = {"R": R, "T": t, "matrix_4x4": E}
                     except Exception:
                         pass
-                        
         except Exception as e:
-            data = {"error": f"Failed to read calibration: {e}"}
-        
-        with open(calibration_path, "w") as f:
-            json.dump(data, f, indent=2)
-        logger.info(f"Calibration data saved to {calibration_path}")
-    
-    def _dump_calibration_from_running_device(self):
-        """Export calibration using the same schema as experiments/record_oak_stereo.py"""
-        if not self._output_dir:
-            logger.error("No output directory set for calibration export")
-            return
-
-        calibration_path = self._output_dir / "calibration.json"
-        logger.debug(f"Exporting calibration to: {calibration_path}")
-
-        data = {}
-        try:
-            w = int(getattr(self, "width", 1280))
-            h = int(getattr(self, "height", 720))
-
-            left_sock = getattr(self, "left_socket", getattr(dai.CameraBoardSocket, "CAM_B", None))
-            right_sock = getattr(self, "right_socket", getattr(dai.CameraBoardSocket, "CAM_C", None))
-            rgb_sock = getattr(self, "rgb_socket", getattr(dai.CameraBoardSocket, "CAM_A", None))
-
-            # Prefer using the running pipeline (matches record_oak behavior), fall back to a direct device
-            logger.debug("Creating device connection for calibration read...")
-            try:
-                if hasattr(self, "_pipeline") and self._pipeline is not None:
-                    device_ctx = dai.Device(self._pipeline)
-                else:
-                    device_ctx = dai.Device()
-            except Exception:
-                # Fallback if pipeline-based construction fails
-                device_ctx = dai.Device()
-
-            with device_ctx as device:
-                logger.debug("Device connected for calibration read")
-                cal = device.readCalibration()
-
-                # Intrinsics
-                K_left = cal.getCameraIntrinsics(left_sock, w, h)
-                K_right = cal.getCameraIntrinsics(right_sock, w, h)
-
-                # Distortion (truncate to first 8 like record_oak)
-                dist_left = cal.getDistortionCoefficients(left_sock)
-                dist_right = cal.getDistortionCoefficients(right_sock)
-
-                # Extrinsics: left->RGB and right->RGB (matches record_oak)
-                L_to_RGB = cal.getCameraExtrinsics(left_sock, rgb_sock)
-                R_to_RGB = cal.getCameraExtrinsics(right_sock, rgb_sock)
-
-                # Also provide left->right 4x4
-                L_to_R = cal.getCameraExtrinsics(left_sock, right_sock)
-
-                data = {
-                    "left": {
-                        "socket": getattr(left_sock, "name", str(left_sock)),
-                        "resolution": [w, h],
-                        "intrinsics": K_left,
-                        "distortion": dist_left[:8] if dist_left is not None else None,
-                        "extrinsics": L_to_RGB,
-                    },
-                    "right": {
-                        "socket": getattr(right_sock, "name", str(right_sock)),
-                        "resolution": [w, h],
-                        "intrinsics": K_right,
-                        "distortion": dist_right[:8] if dist_right is not None else None,
-                        "extrinsics": R_to_RGB,
-                    },
-                    "extrinsics_left_to_right": {
-                        "matrix_4x4": L_to_R,
-                    },
-                }
-
-                # Device metadata
-                try:
-                    data["device_mxid"] = device.getMxId()
-                except Exception:
-                    pass
-
-        except Exception as e:
-            error_msg = f"Failed to read calibration from device: {e}"
-            logger.error(error_msg)
-            logger.exception("Full calibration error details:")
-            data = {"error": error_msg}
+            logger.error(f"Failed to read calibration from device: {e}")
+            data = {"error": f"Failed to read calibration from device: {e}"}
 
         try:
             with open(calibration_path, "w") as f:
@@ -376,345 +243,105 @@ class NativeOAKRecorder:
             logger.error(f"Failed to write calibration file: {e}")
     
     async def initialize_cameras(self, output_dir: Path) -> bool:
-        """Initialize cameras and pipeline (async wrapper for sync operations)"""
+        """Build the pipeline and prepare file paths. No device warmup."""
         def _sync_init():
             try:
                 logger.info("=== INITIALIZING CAMERAS ===")
-                logger.debug(f"Output directory: {output_dir}")
-                logger.debug(f"Camera config: {self.width}x{self.height} @ {self.fps}fps")
-                logger.debug(f"Left socket: {self.left_socket}, Right socket: {self.right_socket}")
-                logger.debug(f"IMU rate: {self.imu_rate_hz}Hz, Bitrate: {self.bitrate_kbps}kbps")
-                
                 self.state = RecorderState.INITIALIZING
-                self._init_start_time = time.time()
                 self._output_dir = output_dir
-                logger.debug(f"State changed to: {self.state.value}")
-                
+
                 # Build pipeline
-                logger.debug("Building DepthAI pipeline...")
-                pipeline_start = time.time()
                 self._pipeline, nodes = self._build_pipeline()
-                pipeline_time = time.time() - pipeline_start
-                logger.debug(f"Pipeline built in {pipeline_time:.3f}s")
-                
                 self._savers = {k: v for k, v in nodes.items() if 'saver' in k}
                 self._loggers = {k: v for k, v in nodes.items() if 'logger' in k}
-                logger.debug(f"Created {len(self._savers)} savers and {len(self._loggers)} loggers")
-                
-                # Set up file paths
-                logger.debug("Creating output directory and setting file paths...")
+
+                # Ensure output directory exists
                 output_dir.mkdir(parents=True, exist_ok=True)
-                
+
+                # Set file paths (.h264 + .csv)
                 left_h264 = output_dir / "left.h264"
                 right_h264 = output_dir / "right.h264"
                 left_csv = output_dir / "left.csv"
                 right_csv = output_dir / "right.csv"
-                imu_csv = output_dir / "imu.csv"
-                
+
                 nodes['saverL'].filename = str(left_h264)
                 nodes['saverR'].filename = str(right_h264)
                 nodes['loggerL'].path = str(left_csv)
                 nodes['loggerR'].path = str(right_csv)
-                nodes['imu_saver'].path = str(imu_csv)
-                
-                logger.debug(f"Video files: {left_h264}, {right_h264}")
-                logger.debug(f"CSV files: {left_csv}, {right_csv}, {imu_csv}")
-                
-                # Note: Device connection will happen when pipeline starts
-                logger.info("Pipeline ready for device connection")
-                logger.debug("Device will be connected when pipeline starts")
-                
-                # Skip calibration during initialization for speed - will export after recording
-                logger.debug("Calibration export will occur after recording stops")
-                cal_time = 0
-                
-                init_time = time.time() - self._init_start_time
-                logger.info(f"Camera initialization completed successfully in {init_time:.3f}s")
-                logger.debug("Initialization breakdown:")
-                logger.debug(f"  Pipeline build: {pipeline_time:.3f}s")
-                logger.debug(f"  Calibration export: {cal_time:.3f}s")
+
+                self.state = RecorderState.READY
+                logger.info("Initialization complete. Recorder READY.")
                 return True
-                
+
             except Exception as e:
                 logger.error(f"Failed to initialize cameras: {e}")
-                logger.exception("Full initialization error details:")
                 self.state = RecorderState.ERROR
-                logger.debug(f"State changed to: {self.state.value}")
                 return False
-        
-        # Run sync initialization in thread pool
-        logger.debug("Running initialization in thread pool...")
+
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, _sync_init)
-        logger.debug(f"Initialization async wrapper completed, result: {result}")
-        return result
+        return await loop.run_in_executor(None, _sync_init)
     
-    async def warmup_cameras(self, warmup_duration: float = 2.0) -> bool:
-        """Warm up cameras without recording (allows auto-exposure to settle)"""
-        def _sync_warmup():
-            try:
-                logger.info("=== WARMING UP CAMERAS ===")
-                logger.debug(f"Requested warmup duration: {warmup_duration:.3f}s")
-                logger.debug(f"Current state: {self.state.value}")
-                
-                self.state = RecorderState.WARMING_UP
-                self._warmup_start_time = time.time()
-                logger.debug(f"State changed to: {self.state.value}")
-                
-                if not self._pipeline:
-                    error_msg = "Pipeline must be initialized before warming up"
-                    logger.error(error_msg)
-                    logger.debug(f"Pipeline exists: {self._pipeline is not None}")
-                    raise RuntimeError(error_msg)
-                
-                # Start pipeline for warmup (but don't save data yet)
-                logger.info("Starting pipeline for camera warmup...")
-                logger.debug("Calling pipeline.start()...")
-                pipeline_start_time = time.time()
-                
-                try:
-                    self._pipeline.start()
-                    pipeline_start_duration = time.time() - pipeline_start_time
-                    logger.debug(f"Pipeline started successfully in {pipeline_start_duration:.3f}s")
-                    
-                    # Check if pipeline is running
-                    if hasattr(self._pipeline, 'isRunning'):
-                        is_running = self._pipeline.isRunning()
-                        logger.debug(f"Pipeline running status: {is_running}")
-                    
-                except Exception as e:
-                    logger.error(f"Failed to start pipeline for warmup: {e}")
-                    logger.exception("Pipeline start error details:")
-                    raise
-                
-                logger.info(f"Warming up cameras for {warmup_duration}s...")
-                logger.debug("Beginning warmup sleep period...")
-                
-                # Sleep in smaller chunks to allow for monitoring
-                sleep_interval = 0.5
-                total_slept = 0.0
-                while total_slept < warmup_duration:
-                    chunk_sleep = min(sleep_interval, warmup_duration - total_slept)
-                    time.sleep(chunk_sleep)
-                    total_slept += chunk_sleep
-                    logger.debug(f"Warmup progress: {total_slept:.1f}s / {warmup_duration:.1f}s")
-                
-                warmup_time = time.time() - self._warmup_start_time
-                logger.info(f"Camera warmup completed in {warmup_time:.3f}s")
-                logger.debug(f"Actual warmup time vs requested: {warmup_time:.3f}s vs {warmup_duration:.3f}s")
-                
-                self.state = RecorderState.READY
-                logger.debug(f"State changed to: {self.state.value}")
-                logger.info("Cameras are now warmed up and ready for recording")
-                return True
-                
-            except Exception as e:
-                logger.error(f"Failed to warm up cameras: {e}")
-                logger.exception("Full warmup error details:")
-                self.state = RecorderState.ERROR
-                logger.debug(f"State changed to: {self.state.value}")
-                return False
-        
-        # Run sync warmup in thread pool
-        logger.debug("Running warmup in thread pool...")
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, _sync_warmup)
-        logger.debug(f"Warmup async wrapper completed, result: {result}")
-        return result
+    async def warmup_cameras(self, warmup_duration: float = 0.0) -> bool:
+        if not self._pipeline:
+            logger.error("Pipeline must be initialized before warmup")
+            return False
+        # Cuurently no-op. Immediately mark as ready
+        self.state = RecorderState.READY
+        return True
     
     def start_recording(self) -> bool:
-        """Start recording (cameras should already be warmed up)"""
+        """Start recording by starting the pipeline."""
         try:
-            logger.info("=== STARTING RECORDING ===")
-            logger.debug(f"Current state: {self.state.value}")
-            logger.debug(f"Pipeline exists: {self._pipeline is not None}")
-            
-            if self.state != RecorderState.READY:
-                error_msg = f"Cannot start recording from state: {self.state.value}"
-                logger.error(error_msg)
-                logger.debug("Expected state: READY")
-                logger.debug("Ensure cameras are initialized and warmed up first")
-                raise RuntimeError(error_msg)
-            
             if not self._pipeline:
-                error_msg = "Pipeline not available for recording"
-                logger.error(error_msg)
-                raise RuntimeError(error_msg)
-                
-            # Check if pipeline is already running from warmup
-            pipeline_was_running = False
-            if hasattr(self._pipeline, 'isRunning'):
-                pipeline_was_running = self._pipeline.isRunning()
-                logger.debug(f"Pipeline already running: {pipeline_was_running}")
-            
+                raise RuntimeError("Pipeline not initialized. Call initialize_cameras first.")
+            self._pipeline.start()
             self.state = RecorderState.RECORDING
             self._recording_start_time = time.time()
-            self._stop_event.clear()
-            logger.debug(f"State changed to: {self.state.value}")
-            logger.debug(f"Recording start time: {self._recording_start_time}")
-            
-            # Pipeline should already be running from warmup, but verify
-            if pipeline_was_running:
-                logger.info("Using already-running pipeline from warmup phase")
-            else:
-                logger.warning("Pipeline not running - this may indicate warmup was skipped")
-                logger.debug("Starting pipeline now...")
-                try:
-                    self._pipeline.start()
-                    logger.debug("Pipeline started for recording")
-                except Exception as e:
-                    logger.error(f"Failed to start pipeline for recording: {e}")
-                    raise
-            
-            logger.info("Recording started successfully")
-            logger.debug("Video data will now be saved to files")
+            logger.info("Recording started")
             return True
-            
         except Exception as e:
             logger.error(f"Failed to start recording: {e}")
-            logger.exception("Full recording start error details:")
             self.state = RecorderState.ERROR
-            logger.debug(f"State changed to: {self.state.value}")
             return False
     
     def stop_recording(self) -> bool:
-        """Stop recording and clean up resources"""
+        """Stop recording, close files, and reset state."""
         try:
-            logger.info("=== STOPPING RECORDING ===")
-            logger.debug(f"Current state: {self.state.value}")
-            logger.debug(f"Pipeline exists: {self._pipeline is not None}")
-            
-            self.state = RecorderState.STOPPING
-            logger.debug(f"State changed to: {self.state.value}")
-            
-            # Stop pipeline
-            if self._pipeline:
-                logger.debug("Checking pipeline status...")
-                pipeline_was_running = False
-                if hasattr(self._pipeline, 'isRunning'):
-                    pipeline_was_running = self._pipeline.isRunning()
-                    logger.debug(f"Pipeline was running: {pipeline_was_running}")
-                
-                if pipeline_was_running:
-                    logger.info("Stopping pipeline...")
-                    logger.debug("Calling pipeline.stop()...")
-                    stop_start = time.time()
-                    
-                    try:
-                        self._pipeline.stop()
-                        logger.debug("Pipeline stop called, now waiting...")
-                        self._pipeline.wait()
-                        stop_duration = time.time() - stop_start
-                        logger.debug(f"Pipeline stopped successfully in {stop_duration:.3f}s")
-                    except Exception as e:
-                        logger.error(f"Error stopping pipeline: {e}")
-                        logger.exception("Pipeline stop error details:")
-                else:
-                    logger.debug("Pipeline was not running")
-            else:
-                logger.debug("No pipeline to stop")
-            
-            # Close all savers and loggers
-            logger.debug("Closing savers and loggers...")
-            saver_count = len(self._savers)
-            logger_count = len(self._loggers)
-            logger.debug(f"Closing {saver_count} savers and {logger_count} loggers")
-            
-            for name, saver in self._savers.items():
-                logger.debug(f"Closing saver: {name}")
+            if self._pipeline and hasattr(self._pipeline, 'isRunning') and self._pipeline.isRunning():
+                self._pipeline.stop()
+                self._pipeline.wait()
+
+            # Close host nodes
+            for saver in self._savers.values():
                 try:
                     saver.close()
-                    logger.debug(f"Saver {name} closed successfully")
-                except Exception as e:
-                    logger.error(f"Error closing saver {name}: {e}")
-                    
-            for name, logger_node in self._loggers.items():
-                logger.debug(f"Closing logger: {name}")
+                except Exception:
+                    pass
+            for logger_node in self._loggers.values():
                 try:
                     logger_node.close()
-                    logger.debug(f"Logger {name} closed successfully")
-                except Exception as e:
-                    logger.error(f"Error closing logger {name}: {e}")
-            
-            # Device connection is managed by pipeline, no need to close explicitly
-            logger.debug("Device connection will be closed with pipeline")
-            
-            # Export calibration data after pipeline stops and device is freed
-            logger.info("Exporting calibration data after recording...")
-            cal_start = time.time()
+                except Exception:
+                    pass
+
+            # Dump calibration after stopping pipeline
             try:
                 self._dump_calibration_from_running_device()
-                cal_duration = time.time() - cal_start
-                logger.info(f"Calibration export completed in {cal_duration:.3f}s")
             except Exception as e:
-                logger.error(f"Failed to export calibration: {e}")
-                logger.exception("Calibration export error details:")
-            
-            # Calculate recording duration
-            recording_duration = 0
-            if self._recording_start_time:
-                recording_duration = time.time() - self._recording_start_time
-                logger.debug(f"Recording duration: {recording_duration:.3f}s")
-            else:
-                logger.debug("No recording start time available")
-            
-            logger.info(f"Recording stopped successfully. Duration: {recording_duration:.3f}s")
-            
+                logger.warning(f"Calibration dump failed: {e}")
+
             self.state = RecorderState.STOPPED
-            logger.debug(f"State changed to: {self.state.value}")
-            
-            # Log final file information
-            if self._output_dir:
-                logger.debug(f"Recording files saved in: {self._output_dir}")
-                try:
-                    # Check if files exist and their sizes
-                    left_h264 = self._output_dir / "left.h264"
-                    right_h264 = self._output_dir / "right.h264"
-                    
-                    if left_h264.exists():
-                        size_mb = left_h264.stat().st_size / 1024 / 1024
-                        logger.debug(f"Left video: {left_h264} ({size_mb:.1f} MB)")
-                    else:
-                        logger.warning(f"Left video file not found: {left_h264}")
-                        
-                    if right_h264.exists():
-                        size_mb = right_h264.stat().st_size / 1024 / 1024
-                        logger.debug(f"Right video: {right_h264} ({size_mb:.1f} MB)")
-                    else:
-                        logger.warning(f"Right video file not found: {right_h264}")
-                        
-                except Exception as e:
-                    logger.debug(f"Error checking output files: {e}")
-            
+            logger.info("Recording stopped")
             return True
-            
         except Exception as e:
             logger.error(f"Failed to stop recording: {e}")
-            logger.exception("Full recording stop error details:")
             self.state = RecorderState.ERROR
-            logger.debug(f"State changed to: {self.state.value}")
             return False
     
     def get_state(self) -> Dict[str, Any]:
-        """Get current recorder state and timing information"""
         current_time = time.time()
-        
-        timing = {}
-        if self._init_start_time:
-            if self.state == RecorderState.INITIALIZING:
-                timing['init_elapsed'] = current_time - self._init_start_time
-            else:
-                timing['init_duration'] = self._warmup_start_time - self._init_start_time if self._warmup_start_time else None
-        
-        if self._warmup_start_time:
-            if self.state == RecorderState.WARMING_UP:
-                timing['warmup_elapsed'] = current_time - self._warmup_start_time
-            else:
-                timing['warmup_duration'] = (self._recording_start_time or current_time) - self._warmup_start_time
-        
+        timing: Dict[str, float] = {}
         if self._recording_start_time and self.state == RecorderState.RECORDING:
             timing['recording_elapsed'] = current_time - self._recording_start_time
-        
         return {
             'state': self.state.value,
             'output_dir': str(self._output_dir) if self._output_dir else None,
@@ -722,18 +349,24 @@ class NativeOAKRecorder:
             'config': {
                 'width': self.width,
                 'height': self.height,
-                'fps': self.fps,
-                'bitrate_kbps': self.bitrate_kbps
+                'fps': self.fps
             }
         }
     
     def cleanup(self):
-        """Clean up all resources"""
-        if self.state != RecorderState.STOPPED:
+        if self.state == RecorderState.RECORDING:
             self.stop_recording()
-            
         self._pipeline = None
-        self._device = None
         self._savers = {}
         self._loggers = {}
         self._output_dir = None
+
+    @staticmethod
+    def flip_K_180(K, W, H):
+        K = [row[:] for row in K]
+        K[0][2] = (W - 1) - K[0][2]   # cx'
+        K[1][2] = (H - 1) - K[1][2]   # cy'
+        K[0][0] = -K[0][0]            # fx'
+        K[1][1] = -K[1][1]            # fy'
+        K[0][1] = -K[0][1]            # s'
+        return K
