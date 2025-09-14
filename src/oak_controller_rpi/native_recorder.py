@@ -32,7 +32,7 @@ class VideoSaver(dai.node.HostNode):
         self.filename = None
         self._fh = None
 
-    def build(self, *link_args, filename="video.h265"):
+    def build(self, *link_args, filename="video.h264"):
         self.link_args(*link_args)
         self.filename = filename
         return self
@@ -405,19 +405,19 @@ class NativeOAKRecorder:
                 logger.debug("Creating output directory and setting file paths...")
                 output_dir.mkdir(parents=True, exist_ok=True)
                 
-                left_h265 = output_dir / "left.h265"
-                right_h265 = output_dir / "right.h265"
+                left_h264 = output_dir / "left.h264"
+                right_h264 = output_dir / "right.h264"
                 left_csv = output_dir / "left.csv"
                 right_csv = output_dir / "right.csv"
                 imu_csv = output_dir / "imu.csv"
                 
-                nodes['saverL'].filename = str(left_h265)
-                nodes['saverR'].filename = str(right_h265)
+                nodes['saverL'].filename = str(left_h264)
+                nodes['saverR'].filename = str(right_h264)
                 nodes['loggerL'].path = str(left_csv)
                 nodes['loggerR'].path = str(right_csv)
                 nodes['imu_saver'].path = str(imu_csv)
                 
-                logger.debug(f"Video files: {left_h265}, {right_h265}")
+                logger.debug(f"Video files: {left_h264}, {right_h264}")
                 logger.debug(f"CSV files: {left_csv}, {right_csv}, {imu_csv}")
                 
                 # Note: Device connection will happen when pipeline starts
@@ -668,20 +668,20 @@ class NativeOAKRecorder:
                 logger.debug(f"Recording files saved in: {self._output_dir}")
                 try:
                     # Check if files exist and their sizes
-                    left_h265 = self._output_dir / "left.h265"
-                    right_h265 = self._output_dir / "right.h265"
+                    left_h264 = self._output_dir / "left.h264"
+                    right_h264 = self._output_dir / "right.h264"
                     
-                    if left_h265.exists():
-                        size_mb = left_h265.stat().st_size / 1024 / 1024
-                        logger.debug(f"Left video: {left_h265} ({size_mb:.1f} MB)")
+                    if left_h264.exists():
+                        size_mb = left_h264.stat().st_size / 1024 / 1024
+                        logger.debug(f"Left video: {left_h264} ({size_mb:.1f} MB)")
                     else:
-                        logger.warning(f"Left video file not found: {left_h265}")
+                        logger.warning(f"Left video file not found: {left_h264}")
                         
-                    if right_h265.exists():
-                        size_mb = right_h265.stat().st_size / 1024 / 1024
-                        logger.debug(f"Right video: {right_h265} ({size_mb:.1f} MB)")
+                    if right_h264.exists():
+                        size_mb = right_h264.stat().st_size / 1024 / 1024
+                        logger.debug(f"Right video: {right_h264} ({size_mb:.1f} MB)")
                     else:
-                        logger.warning(f"Right video file not found: {right_h265}")
+                        logger.warning(f"Right video file not found: {right_h264}")
                         
                 except Exception as e:
                     logger.debug(f"Error checking output files: {e}")
