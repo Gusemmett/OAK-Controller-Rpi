@@ -12,17 +12,19 @@ This project implements a MultiCam API server for OAK (OpenCV AI Kit) devices on
 
 ## Installation
 
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
+### Environment
+Current recomendation for env control with this repo is to use venv. Pixi support will be added when depthai v3 is out of pre-release mode and has wheels for macosx and rpi.
+
+```
+python -m venv .env
 ```
 
-2. Ensure you have `ffmpeg` installed for video format conversion:
+### Install dependencies
 ```bash
-# On Raspberry Pi OS
-sudo apt update
-sudo apt install ffmpeg
+pip install -r requirements.txt
+pip install --pre depthai --force-reinstall
 ```
+
 
 ## Usage
 
@@ -37,143 +39,10 @@ Options:
 - `--videos-dir DIR`: Video storage directory (default: ./videos)
 - `--log-level LEVEL`: Logging level (DEBUG, INFO, WARNING, ERROR)
 
-### Test the Server
+### Scripts
 
-```bash
-python3 test_client.py
+#### Slam script
+Uses Luxonis' custom slam node to compute slam. Also spins up rerun viewer for point cloud. 
 ```
-
-### Verify mDNS Advertisement
-
-```bash
-dns-sd -B _multicam._tcp local.
+python scripts/slamScript.py
 ```
-
-## API Commands
-
-The server accepts JSON commands over TCP with the following format:
-
-### Command Structure
-```json
-{
-  "command": "COMMAND_NAME",
-  "parameter": "value"
-}
-```
-
-### Supported Commands
-
-#### START_RECORDING
-Start recording immediately or at scheduled time:
-```json
-{"command": "START_RECORDING"}
-{"command": "START_RECORDING", "timestamp": 1640995200.0}
-```
-
-Response:
-- Immediate: `{"status": "Command received", "isRecording": true}`
-- Scheduled: `{"status": "Scheduled recording accepted", "isRecording": false}`
-
-#### STOP_RECORDING  
-Stop active recording:
-```json
-{"command": "STOP_RECORDING"}
-```
-
-Response:
-```json
-{
-  "status": "Recording stopped", 
-  "isRecording": false,
-  "fileId": "video_1640995200"
-}
-```
-
-#### DEVICE_STATUS
-Get current device state:
-```json
-{"command": "DEVICE_STATUS"}
-```
-
-Response:
-```json
-{
-  "status": "ready",
-  "isRecording": false,
-  "deviceId": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
-#### HEARTBEAT
-Keep-alive ping:
-```json
-{"command": "HEARTBEAT"}
-```
-
-Response:
-```json
-{"status": "Heartbeat acknowledged"}
-```
-
-#### GET_VIDEO
-Download recorded video file:
-```json
-{"command": "GET_VIDEO", "fileId": "video_1640995200"}
-```
-
-Response: Binary file transfer protocol
-1. 4-byte header length (big-endian uint32)
-2. JSON header with file info
-3. Raw file bytes
-
-## File Structure
-
-```
-OAK-Controller-Rpi/
-├── src/oak_controller_rpi/
-│   ├── __init__.py
-│   ├── __main__.py
-│   └── server.py              # Main server implementation
-├── scripts/
-│   └── simpleRecorder.py      # OAK recording script
-├── run_multicam_server.py     # Server startup script
-├── test_client.py             # Test client
-├── requirements.txt           # Dependencies
-└── README.md                  # This file
-```
-
-## Technical Details
-
-### mDNS Service
-- Service Type: `_multicam._tcp.local.`
-- Service Name: `multiCam-{deviceId}`  
-- Port: 8080
-- Persistent device ID stored in `~/.multicam_device_id`
-
-### Recording Pipeline
-1. Uses `simpleRecorder.py` for OAK camera control
-2. Records H.265 video streams from stereo cameras
-3. Converts to .mov format using ffmpeg
-4. Stores files in configurable videos directory
-5. Maintains file mapping for GET_VIDEO requests
-
-### Protocol Details
-- TCP connections on port 8080
-- UTF-8 JSON for commands
-- Big-endian length prefixes for message framing
-- Binary transfer for video files
-- Graceful error handling and connection management
-
-## Testing Checklist
-
-- ☑ Device discoverable via `dns-sd -B _multicam._tcp local.`
-- ☑ Controller connects to TCP port 8080  
-- ☑ DEVICE_STATUS returns proper JSON response
-- ☑ START_RECORDING/STOP_RECORDING work correctly
-- ☑ GET_VIDEO delivers files with correct binary protocol
-- ☑ Multiple controllers can connect simultaneously
-- ☑ Scheduled recording respects timing constraints
-
-## Compatibility
-
-This implementation provides a drop-in replacement for iPhone multiCam nodes, maintaining API compatibility while leveraging OAK hardware capabilities.
