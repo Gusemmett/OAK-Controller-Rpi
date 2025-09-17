@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, Tuple
 from enum import Enum
 
 import depthai as dai
-from .custom_host_nodes import VideoSaver, TsLogger
+from .custom_host_nodes import VideoSaver, TsLogger, PoseCSVLoggerThreaded
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,60 @@ class NativeOAKRecorder:
         loggerL = p.create(TsLogger).build(encL.out)
         loggerR = p.create(TsLogger).build(encR.out)
 
-        nodes = {"saverL": saverL, "saverR": saverR, "loggerL": loggerL, "loggerR": loggerR}
+        # === SLAM graph (StereoDepth + FeatureTracker + VIO + SLAM + IMU) ===
+        imu = p.create(dai.node.IMU)
+        imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
+        imu.setBatchReportThreshold(1)
+        imu.setMaxBatchReports(10)
+
+        stereo = p.create(dai.node.StereoDepth)
+        stereo.setExtendedDisparity(False)
+        stereo.setLeftRightCheck(True)
+        stereo.setRectifyEdgeFillColor(0)
+        stereo.enableDistortionCorrection(True)
+        stereo.initialConfig.setLeftRightCheckThreshold(10)
+        stereo.setDepthAlign(self.left_socket)
+
+        featureTracker = p.create(dai.node.FeatureTracker)
+        featureTracker.setHardwareResources(1, 2)
+        featureTracker.initialConfig.setCornerDetector(dai.FeatureTrackerConfig.CornerDetector.Type.HARRIS)
+        featureTracker.initialConfig.setNumTargetFeatures(1000)
+        featureTracker.initialConfig.setMotionEstimator(False)
+        featureTracker.initialConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 49
+
+        odom = p.create(dai.node.RTABMapVIO)
+        slam = p.create(dai.node.RTABMapSLAM)
+        slam_params = {"RGBD/CreateOccupancyGrid": "true",
+                       "Grid/3D": "true",
+                       "Rtabmap/SaveWMState": "true"}
+        slam.setParams(slam_params)
+
+        # Link camera outputs into both Sync/Encoder path and SLAM path
+        # Feed rectification/depth
+        sourceL.link(stereo.left)
+        sourceR.link(stereo.right)
+
+        # Feature tracking and VIO/SLAM chain
+        featureTracker.passthroughInputImage.link(odom.rect)
+        stereo.rectifiedLeft.link(featureTracker.inputImage)
+        stereo.depth.link(odom.depth)
+        imu.out.link(odom.imu)
+        featureTracker.outputFeatures.link(odom.features)
+
+        odom.transform.link(slam.odom)
+        odom.passthroughRect.link(slam.rect)
+        odom.passthroughDepth.link(slam.depth)
+
+        # Pose logger host node: expects two inputs; feed transform + an image stream
+        poseLogger = p.create(PoseCSVLoggerThreaded).build(slam.transform, slam.passthroughRect)
+
+        nodes = {
+            "saverL": saverL,
+            "saverR": saverR,
+            "loggerL": loggerL,
+            "loggerR": loggerR,
+            "poseLogger": poseLogger,
+        }
         logger.info("DepthAI pipeline built")
         return p, nodes
 
@@ -209,11 +262,14 @@ class NativeOAKRecorder:
                 right_h264 = output_dir / "right.h264"
                 left_csv = output_dir / "left.csv"
                 right_csv = output_dir / "right.csv"
+                slam_csv = output_dir / "slam.csv"
 
                 nodes['saverL'].filename = str(left_h264)
                 nodes['saverR'].filename = str(right_h264)
                 nodes['loggerL'].path = str(left_csv)
                 nodes['loggerR'].path = str(right_csv)
+                if 'poseLogger' in nodes:
+                    nodes['poseLogger'].path = str(slam_csv)
 
                 self.state = RecorderState.READY
                 logger.info("Initialization complete. Recorder READY.")
