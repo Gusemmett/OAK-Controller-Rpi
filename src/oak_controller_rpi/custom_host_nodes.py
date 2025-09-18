@@ -52,10 +52,7 @@ class TsLogger(dai.node.HostNode):
             self._w = csv.writer(self._f)
             self._w.writerow(["ts_ns", "frame_idx"])
 
-        # Get device timestamp, fallback to host timestamp
-        ts = getattr(pkt, "getTimestampDevice", None)
-        ts = ts() if ts else pkt.getTimestamp()
-        ts_ns = int(ts.total_seconds() * 1e9)
+        ts_ns = ts_ns = int(pkt.getTimestampDevice().total_seconds() * 1e9)
         self._w.writerow([ts_ns, pkt.getSequenceNum()])
 
     def close(self):
@@ -80,86 +77,52 @@ class IMUCSVLogger(dai.node.HostNode):
         self.path = None
         self._w = None
         self._f = None
-        self._methods = None  # type: ignore
 
     def build(self, *link_args, path="imu.csv"):
         self.link_args(*link_args)
         self.path = path
         return self
 
-    def _discover_methods(self, pkt):
-        method_names = []
-        for name in dir(pkt):
-            if name.startswith("__") and name.endswith("__"):
-                continue
-            # Skip attributes that look like properties/constants
-            try:
-                attr = getattr(pkt, name)
-            except Exception:
-                continue
-            if not callable(attr):
-                continue
-            # Prefer methods that take no parameters (besides implicit self)
-            include = False
-            try:
-                sig = inspect.signature(attr)
-                params = [p for p in sig.parameters.values() if p.kind in (
-                    inspect.Parameter.POSITIONAL_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    inspect.Parameter.KEYWORD_ONLY,
-                )]
-                # Bound methods typically expose zero parameters if no args required
-                include = len(params) == 0
-            except (ValueError, TypeError):
-                # Some pybind11 methods don't expose a signature; try calling
-                include = True
-            if not include:
-                continue
-            # Test call to verify it actually works without args
-            try:
-                _ = attr()
-                method_names.append(name)
-            except Exception:
-                # Skip methods requiring arguments or failing
-                continue
-        # Stable order
-        method_names.sort()
-        return method_names
-
-    def _ensure_writer(self, pkt):
+    def _ensure_writer(self):
         if self._w is None:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             self._f = open(self.path, "w", newline="")
             self._w = csv.writer(self._f)
-            # Discover methods on first packet
-            self._methods = self._discover_methods(pkt)
-            header = ["ts_ns", "pkt"] + list(self._methods)
+            header = ["ts_ns",
+                     "accel_x", "accel_y", "accel_z",
+                     "gyro_x", "gyro_y", "gyro_z",
+                     "mag_x", "mag_y", "mag_z",
+                     "rot_i", "rot_j", "rot_k"]
             self._w.writerow(header)
 
     def process(self, pkt):
-        self._ensure_writer(pkt)
+        self._ensure_writer()
 
-        ts_fn = getattr(pkt, "getTimestampDevice", None)
-        ts = ts_fn() if callable(ts_fn) else pkt.getTimestamp()
-        ts_ns = int(ts.total_seconds() * 1e9)
+        ts_ns = int(pkt.getTimestampDevice().total_seconds() * 1e9)
 
-        row = [ts_ns, str(pkt)]
-        for name in self._methods:  # type: ignore
-            try:
-                val = getattr(pkt, name)()
-                # Stringify; keep compact
-                row.append(str(val))
-            except Exception:
-                row.append("ERR")
-        self._w.writerow(row)
+        # Process each packet
+        for p in pkt.packets:
+            # Extract values from packet components
+            accel = p.acceleroMeter
+            gyro = p.gyroscope
+            mag = p.magneticField
+            rot = p.rotationVector
+
+            # Build row with all sensor values
+            row = [ts_ns,
+                   accel.x, accel.y, accel.z,
+                   gyro.x, gyro.y, gyro.z,
+                   mag.x, mag.y, mag.z, 
+                   rot.i, rot.j, rot.k]
+            
+            # Write row for this packet
+            self._w.writerow(row)
 
     def close(self):
         if self._f:
             self._f.close()
             self._f = None
             self._w = None
-
-
 
 
 class PoseCSVLoggerThreaded(dai.node.ThreadedHostNode):

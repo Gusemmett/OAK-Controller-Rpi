@@ -19,10 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 class MultiCamDevice:
-    def __init__(self, port: int = 8080, videos_dir: str = "/home/pi/videos"):
+    def __init__(self, port: int = 8080, videos_dir: str = "/home/pi/videos", enable_slam: bool = False):
         self.port = port
         self.videos_dir = Path(videos_dir)
         self.videos_dir.mkdir(parents=True, exist_ok=True)
+        self.enable_slam = enable_slam
         
         # Generate persistent device ID
         self.device_id = self._get_or_create_device_id()
@@ -138,7 +139,7 @@ class MultiCamDevice:
         try:
             # Create native recorder immediately
             logger.debug("Creating NativeOAKRecorder instance...")
-            self.native_recorder = NativeOAKRecorder()
+            self.native_recorder = NativeOAKRecorder(enable_slam=self.enable_slam)
             logger.debug("Native recorder created successfully")
             
             # Phase 1: Initialize cameras (typically takes ~1-2 seconds)
@@ -261,7 +262,7 @@ class MultiCamDevice:
                 logger.info(f"Output directory: {output_dir}")
                 
                 # Create native recorder
-                self.native_recorder = NativeOAKRecorder()
+                self.native_recorder = NativeOAKRecorder(enable_slam=self.enable_slam)
                 
                 # Initialize cameras
                 logger.info("Initializing cameras...")

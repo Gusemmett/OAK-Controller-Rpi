@@ -9,7 +9,8 @@ from typing import Optional, Dict, Any, Tuple
 from enum import Enum
 
 import depthai as dai
-from .custom_host_nodes import VideoSaver, TsLogger, PoseCSVLoggerThreaded
+from .custom_host_nodes import VideoSaver, TsLogger, IMUCSVLogger
+from .native_recorder_utilities import build_slam_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,8 @@ class NativeOAKRecorder:
                  width: int = 1280,
                  height: int = 720,
                  fps: float = 30.0,
-                 is_camera_upside_down: bool = True):
+                 is_camera_upside_down: bool = True,
+                 enable_slam: bool = False):
 
         self.width = width
         self.height = height
@@ -45,6 +47,7 @@ class NativeOAKRecorder:
         self.left_socket = self._parse_socket(left_socket_name)
         self.right_socket = self._parse_socket(right_socket_name)
         self.is_camera_upside_down = is_camera_upside_down
+        self.enable_slam = enable_slam
 
         # State
         self.state = RecorderState.STOPPED
@@ -104,65 +107,40 @@ class NativeOAKRecorder:
             profile=dai.VideoEncoderProperties.Profile.H264_MAIN
         )
 
+        # Create IMU node here (after encoders), and pass its output to the SLAM builder
+        imu = p.create(dai.node.IMU)
+        imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER, dai.IMUSensor.GYROSCOPE_CALIBRATED, dai.IMUSensor.MAGNETOMETER_CALIBRATED, dai.IMUSensor.ROTATION_VECTOR], 200)
+        imu.setBatchReportThreshold(1)
+        imu.setMaxBatchReports(10)
+
         saverL = p.create(VideoSaver).build(encL.out)
         saverR = p.create(VideoSaver).build(encR.out)
         loggerL = p.create(TsLogger).build(encL.out)
         loggerR = p.create(TsLogger).build(encR.out)
+        imuLogger = p.create(IMUCSVLogger).build(imu.out)
 
-        # === SLAM graph (StereoDepth + FeatureTracker + VIO + SLAM + IMU) ===
-        imu = p.create(dai.node.IMU)
-        imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
-        imu.setBatchReportThreshold(1)
-        imu.setMaxBatchReports(10)
-
-        stereo = p.create(dai.node.StereoDepth)
-        stereo.setExtendedDisparity(False)
-        stereo.setLeftRightCheck(True)
-        stereo.setRectifyEdgeFillColor(0)
-        stereo.enableDistortionCorrection(True)
-        stereo.initialConfig.setLeftRightCheckThreshold(10)
-        stereo.setDepthAlign(self.left_socket)
-
-        featureTracker = p.create(dai.node.FeatureTracker)
-        featureTracker.setHardwareResources(1, 2)
-        featureTracker.initialConfig.setCornerDetector(dai.FeatureTrackerConfig.CornerDetector.Type.HARRIS)
-        featureTracker.initialConfig.setNumTargetFeatures(1000)
-        featureTracker.initialConfig.setMotionEstimator(False)
-        featureTracker.initialConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 49
-
-        odom = p.create(dai.node.RTABMapVIO)
-        slam = p.create(dai.node.RTABMapSLAM)
-        slam_params = {"RGBD/CreateOccupancyGrid": "true",
-                       "Grid/3D": "true",
-                       "Rtabmap/SaveWMState": "true"}
-        slam.setParams(slam_params)
-
-        # Link camera outputs into both Sync/Encoder path and SLAM path
-        # Feed rectification/depth
-        sourceL.link(stereo.left)
-        sourceR.link(stereo.right)
-
-        # Feature tracking and VIO/SLAM chain
-        featureTracker.passthroughInputImage.link(odom.rect)
-        stereo.rectifiedLeft.link(featureTracker.inputImage)
-        stereo.depth.link(odom.depth)
-        imu.out.link(odom.imu)
-        featureTracker.outputFeatures.link(odom.features)
-
-        odom.transform.link(slam.odom)
-        odom.passthroughRect.link(slam.rect)
-        odom.passthroughDepth.link(slam.depth)
-
-        # Pose logger host node: expects two inputs; feed transform + an image stream
-        poseLogger = p.create(PoseCSVLoggerThreaded).build(slam.transform, slam.passthroughRect)
+        # === Optional SLAM graph (StereoDepth + FeatureTracker + VIO + SLAM + IMU) ===
+        poseLogger = None
+        if self.enable_slam:
+            slam_nodes = build_slam_pipeline(
+                p,
+                source_left=sourceL,
+                source_right=sourceR,
+                depth_align_socket=self.left_socket,
+                imu_output=imu.out,
+                create_pose_logger=True,
+            )
+            poseLogger = slam_nodes.get("poseLogger")
 
         nodes = {
             "saverL": saverL,
             "saverR": saverR,
             "loggerL": loggerL,
             "loggerR": loggerR,
-            "poseLogger": poseLogger,
+            "imuLogger": imuLogger
         }
+        if poseLogger is not None:
+            nodes["poseLogger"] = poseLogger
         logger.info("DepthAI pipeline built")
         return p, nodes
 
@@ -263,11 +241,13 @@ class NativeOAKRecorder:
                 left_csv = output_dir / "left.csv"
                 right_csv = output_dir / "right.csv"
                 slam_csv = output_dir / "slam.csv"
+                imu_csv = output_dir / "imu.csv"
 
                 nodes['saverL'].filename = str(left_h264)
                 nodes['saverR'].filename = str(right_h264)
                 nodes['loggerL'].path = str(left_csv)
                 nodes['loggerR'].path = str(right_csv)
+                nodes['imuLogger'].path = str(imu_csv)
                 if 'poseLogger' in nodes:
                     nodes['poseLogger'].path = str(slam_csv)
 
@@ -351,7 +331,8 @@ class NativeOAKRecorder:
             'config': {
                 'width': self.width,
                 'height': self.height,
-                'fps': self.fps
+                'fps': self.fps,
+                'enable_slam': self.enable_slam
             }
         }
     
