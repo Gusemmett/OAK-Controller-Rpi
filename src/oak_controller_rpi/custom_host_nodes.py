@@ -6,6 +6,7 @@ import inspect
 from collections import deque
 import depthai as dai
 import time
+import cv2
 
 
 class VideoSaver(dai.node.HostNode):
@@ -280,3 +281,85 @@ class PoseCSVLoggerThreaded(dai.node.ThreadedHostNode):
             self._f.close()
             self._f = None
             self._w = None
+
+
+class DepthLogger(dai.node.HostNode):
+    """
+    Threaded logger for StereoDepth outputs.
+
+    Inputs:
+      - depth: dai.ImgFrame (RAW16 depth values in millimeters; 0 means invalid)
+      - confidence: dai.ImgFrame (RAW8 confidence map)
+
+    Behavior:
+      - For each incoming packet on either input, prints available method and
+        attribute names (no values) to stdout. Intended for introspection only.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._in_depth = None
+        self._in_conf = None
+        self.path = "depth"
+
+    def link_args(self, depth_stream, confidence_stream):
+        if self._in_depth is None:
+            self._in_depth = self.createInput("depth")
+        if self._in_conf is None:
+            self._in_conf = self.createInput("confidence")
+
+        depth_stream.link(self._in_depth)
+        confidence_stream.link(self._in_conf)
+
+        # Process will be called per packet; keep inputs non-blocking
+        try:
+            self._in_depth.setBlocking(False)
+            self._in_conf.setBlocking(False)
+        except Exception:
+            pass
+
+    def build(self, depth_stream, confidence_stream, path: str = "depth"):
+        self.link_args(depth_stream, confidence_stream)
+        self.path = path
+        try:
+            os.makedirs(self.path, exist_ok=True)
+        except Exception:
+            pass
+        return self
+
+    def process(self, depth_packet, confidence_packet):
+        # Ensure output dir exists
+        try:
+            os.makedirs(self.path, exist_ok=True)
+        except Exception:
+            pass
+
+        # Save depth (RAW16, mm)
+        try:
+            depth_frame = depth_packet.getFrame()
+            depth_seq = depth_packet.getSequenceNum()
+            if depth_frame is not None and depth_seq is not None:
+                if getattr(depth_frame, 'dtype', None) != 'uint16':
+                    depth_frame = depth_frame.astype('uint16')
+                depth_path = os.path.join(self.path, f"depth_{depth_seq:06d}.png")
+                try:
+                    cv2.imwrite(depth_path, depth_frame)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Save confidence (RAW8)
+        try:
+            conf_frame = confidence_packet.getFrame()
+            conf_seq = confidence_packet.getSequenceNum()
+            if conf_frame is not None and conf_seq is not None:
+                if getattr(conf_frame, 'dtype', None) != 'uint8':
+                    conf_frame = conf_frame.astype('uint8')
+                conf_path = os.path.join(self.path, f"confidence_{conf_seq:06d}.png")
+                try:
+                    cv2.imwrite(conf_path, conf_frame)
+                except Exception:
+                    pass
+        except Exception:
+            pass

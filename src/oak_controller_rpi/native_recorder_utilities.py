@@ -2,7 +2,7 @@
 
 import depthai as dai
 
-from .custom_host_nodes import PoseCSVLoggerThreaded
+from .custom_host_nodes import PoseCSVLoggerThreaded, DepthLogger
 
 
 def build_slam_pipeline(p: dai.Pipeline,
@@ -72,4 +72,48 @@ def build_slam_pipeline(p: dai.Pipeline,
 
     return nodes
 
+
+
+def build_depth_pipeline(p: dai.Pipeline,
+                         source_left,
+                         source_right,
+                         depth_align_socket) -> dict:
+    """
+    Build and link a StereoDepth subgraph into an existing pipeline.
+
+    Inputs:
+      - p: existing dai.Pipeline
+      - source_left, source_right: image streams to feed into StereoDepth
+      - depth_align_socket: camera socket to align depth to (e.g., left socket)
+
+    Returns:
+      dict of created nodes (currently exposes 'stereo' for future consumers)
+    """
+
+    nodes = {}
+
+    stereo = p.create(dai.node.StereoDepth)
+    # Follow example defaults suitable for general purpose visualization
+    try:
+        stereo.setRectification(True)
+    except Exception:
+        # Some firmware builds may rectify by default; ignore if unavailable
+        pass
+    stereo.setExtendedDisparity(True)
+    stereo.setLeftRightCheck(True)
+    stereo.setRectifyEdgeFillColor(0)
+    stereo.enableDistortionCorrection(True)
+    stereo.initialConfig.setLeftRightCheckThreshold(10)
+    stereo.setDepthAlign(depth_align_socket)
+
+    # Link camera outputs into StereoDepth
+    source_left.link(stereo.left)
+    source_right.link(stereo.right)
+
+    # Attach a DepthLogger that introspects packets
+    depth_logger = p.create(DepthLogger).build(stereo.depth, stereo.confidenceMap)
+
+    nodes["stereo"] = stereo
+    nodes["depthLogger"] = depth_logger
+    return nodes
 

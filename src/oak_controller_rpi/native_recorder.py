@@ -9,8 +9,8 @@ from typing import Optional, Dict, Any, Tuple
 from enum import Enum
 
 import depthai as dai
-from .custom_host_nodes import VideoSaver, TsLogger, IMUCSVLogger
-from .native_recorder_utilities import build_slam_pipeline
+from .custom_host_nodes import VideoSaver, TsLogger, IMUCSVLogger, DepthLogger
+from .native_recorder_utilities import build_slam_pipeline, build_depth_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,8 @@ class NativeOAKRecorder:
                  height: int = 720,
                  fps: float = 30.0,
                  is_camera_upside_down: bool = True,
-                 enable_slam: bool = False):
+                 enable_slam: bool = False,
+                 enable_depth: bool = False):
 
         self.width = width
         self.height = height
@@ -48,6 +49,7 @@ class NativeOAKRecorder:
         self.right_socket = self._parse_socket(right_socket_name)
         self.is_camera_upside_down = is_camera_upside_down
         self.enable_slam = enable_slam
+        self.enable_depth = enable_depth
 
         # State
         self.state = RecorderState.STOPPED
@@ -119,6 +121,16 @@ class NativeOAKRecorder:
         loggerR = p.create(TsLogger).build(encR.out)
         imuLogger = p.create(IMUCSVLogger).build(imu.out)
 
+        # === Optional Depth subgraph (StereoDepth only) ===
+        depth_nodes = None
+        if self.enable_depth:
+            depth_nodes = build_depth_pipeline(
+                p,
+                source_left=sourceL,
+                source_right=sourceR,
+                depth_align_socket=self.left_socket,
+            )
+
         # === Optional SLAM graph (StereoDepth + FeatureTracker + VIO + SLAM + IMU) ===
         poseLogger = None
         if self.enable_slam:
@@ -139,6 +151,8 @@ class NativeOAKRecorder:
             "loggerR": loggerR,
             "imuLogger": imuLogger
         }
+        if depth_nodes is not None:
+            nodes.update({"depthLogger": depth_nodes.get("depthLogger")})
         if poseLogger is not None:
             nodes["poseLogger"] = poseLogger
         logger.info("DepthAI pipeline built")
@@ -242,6 +256,7 @@ class NativeOAKRecorder:
                 right_csv = output_dir / "right.csv"
                 slam_csv = output_dir / "slam.csv"
                 imu_csv = output_dir / "imu.csv"
+                depth_dir = output_dir / "depth"
 
                 nodes['saverL'].filename = str(left_h264)
                 nodes['saverR'].filename = str(right_h264)
@@ -250,6 +265,8 @@ class NativeOAKRecorder:
                 nodes['imuLogger'].path = str(imu_csv)
                 if 'poseLogger' in nodes:
                     nodes['poseLogger'].path = str(slam_csv)
+                if 'depthLogger' in nodes:
+                    nodes['depthLogger'].path = str(depth_dir)
 
                 self.state = RecorderState.READY
                 logger.info("Initialization complete. Recorder READY.")
@@ -332,7 +349,8 @@ class NativeOAKRecorder:
                 'width': self.width,
                 'height': self.height,
                 'fps': self.fps,
-                'enable_slam': self.enable_slam
+                'enable_slam': self.enable_slam,
+                'enable_depth': self.enable_depth
             }
         }
     
