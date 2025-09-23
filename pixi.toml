@@ -1,0 +1,19 @@
+[workspace]
+authors = ["AngusEmmett <gusemmett@gmail.com>"]
+channels = ["conda-forge"]
+name = "OAK-Controller-Rpi"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+install-depthai = "python -m pip install depthai"
+
+[dependencies]
+python = ">=3.13.7,<3.14"
+opencv = ">=4.12.0,<5"
+flask = ">=3.1.2,<4"
+boto3 = ">=1.40.30,<2"
+zeroconf = ">=0.147.2,<0.148"
+aiofiles = ">=24.1.0,<25"
+rerun-sdk = ">=0.24.1,<0.25"
+pip = ">=25.2,<26"

@@ -60,7 +60,7 @@ class MultiCamDevice:
     
     async def start_mdns(self):
         """Start mDNS service advertisement"""
-        service_name = f"multiCam-{self.device_id}._multicam._tcp.local."
+        service_name = f"multiCam-oak-{self.device_id}._multicam._tcp.local."
         
         # Get local IP address - connect to external address to determine local interface
         try:
