@@ -139,7 +139,7 @@ class MultiCamDevice:
         try:
             # Create native recorder immediately
             logger.debug("Creating NativeOAKRecorder instance...")
-            self.native_recorder = NativeOAKRecorder(enable_slam=self.enable_slam)
+            self.native_recorder = NativeOAKRecorder()
             logger.debug("Native recorder created successfully")
             
             # Phase 1: Initialize cameras (typically takes ~1-2 seconds)

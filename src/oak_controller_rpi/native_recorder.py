@@ -71,6 +71,13 @@ class NativeOAKRecorder:
 
         p = dai.Pipeline()
 
+        device = p.getDefaultDevice()
+        try:
+            device.setIrLaserDotProjectorIntensity(0.5)
+        except Exception:
+            logger.info("Device does not support dot projector")
+            pass
+
         camL = p.create(dai.node.Camera).build(self.left_socket, sensorFps=self.fps)
         camR = p.create(dai.node.Camera).build(self.right_socket, sensorFps=self.fps)
 
