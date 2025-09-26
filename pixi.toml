@@ -7,6 +7,7 @@ version = "0.1.0"
 
 [tasks]
 install-depthai = "python -m pip install depthai"
+server = { depends-on = ["install-depthai"], cmd = "python run_multicam_server.py" }
 
 [dependencies]
 python = ">=3.13.7,<3.14"
