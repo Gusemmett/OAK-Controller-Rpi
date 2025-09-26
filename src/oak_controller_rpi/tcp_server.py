@@ -6,6 +6,8 @@ import logging
 import struct
 from typing import Any, Dict
 
+from .multicam_device import DeviceStatus
+
 logger = logging.getLogger(__name__)
 
 
@@ -135,18 +137,18 @@ class MultiCamServer:
         
         elif command == 'HEARTBEAT':
             logger.debug("HEARTBEAT command received")
-            return {"status": "Heartbeat acknowledged"}
+            return {"status": DeviceStatus.COMMAND_RECEIVED.value}
         
         elif command == 'GET_VIDEO':
             file_id = message.get('fileId')
             logger.info(f"GET_VIDEO command for fileId: {file_id}")
             if not file_id:
-                return {"status": "Missing fileId parameter"}
+                return {"status": DeviceStatus.ERROR.value}
             
             video_info = self.device.get_video_info(file_id)
             if not video_info:
                 logger.warning(f"Video file not found: {file_id}")
-                return {"status": "File not found"}
+                return {"status": DeviceStatus.FILE_NOT_FOUND.value}
             
             # Read file data
             try:
@@ -162,11 +164,11 @@ class MultiCamServer:
                 return (header, file_data)  # Tuple for binary transfer
                 
             except Exception as e:
-                return {"status": f"Error reading file: {e}"}
+                return {"status": DeviceStatus.ERROR.value}
         
         else:
             logger.warning(f"Unknown command received: {command}")
-            return {"status": f"Unknown command: {command}"}
+            return {"status": DeviceStatus.ERROR.value}
     
     async def start(self):
         """Start the TCP server"""

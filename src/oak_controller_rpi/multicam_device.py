@@ -6,6 +6,7 @@ import socket
 import time
 import uuid
 import zipfile
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional, Any
 
@@ -13,6 +14,19 @@ from zeroconf import ServiceInfo, Zeroconf
 
 from .native_recorder import NativeOAKRecorder, RecorderState
 from .post_process import StereoPostProcess
+
+
+class DeviceStatus(Enum):
+    """Device status enum matching Swift DeviceStatus schema"""
+    READY = "ready"
+    RECORDING = "recording"
+    STOPPING = "stopping"
+    ERROR = "error"
+    SCHEDULED_RECORDING_ACCEPTED = "scheduled_recording_accepted"
+    RECORDING_STOPPED = "recording_stopped"
+    COMMAND_RECEIVED = "command_received"
+    TIME_NOT_SYNCHRONIZED = "time_not_synchronized"
+    FILE_NOT_FOUND = "file_not_found"
 
 
 logger = logging.getLogger(__name__)
@@ -32,7 +46,7 @@ class MultiCamDevice:
         self.is_recording = False
         self.current_file_id: Optional[str] = None
         self.native_recorder: Optional[NativeOAKRecorder] = None
-        self.status = "ready"  # ready, recording, error
+        self.status = DeviceStatus.READY.value
         
         # File mapping for GET_VIDEO
         self.file_map: Dict[str, Path] = {}
@@ -103,7 +117,7 @@ class MultiCamDevice:
         
         if self.is_recording:
             logger.warning("Recording already in progress, rejecting new start request")
-            return {"status": "Already recording", "isRecording": True}
+            return {"status": DeviceStatus.RECORDING.value, "isRecording": True}
         
         current_time = time.time()
         logger.info(f"Current time: {current_time}, Scheduled time: {scheduled_time}")
@@ -119,12 +133,12 @@ class MultiCamDevice:
             logger.info(f"Pre-generated file ID: {self.current_file_id}")
             
             asyncio.create_task(self._delayed_start_recording_with_warmup(delay, output_dir))
-            return {"status": "Scheduled recording accepted", "isRecording": False}
+            return {"status": DeviceStatus.SCHEDULED_RECORDING_ACCEPTED.value, "isRecording": False}
         else:
             # Start immediately
             logger.info("Starting recording immediately")
             await self._start_recording_now()
-            return {"status": "Command received", "isRecording": self.is_recording}
+            return {"status": DeviceStatus.COMMAND_RECEIVED.value, "isRecording": self.is_recording}
     
     async def _delayed_start_recording_with_warmup(self, delay: float, output_dir: Path):
         """Start recording after delay, using the delay time to warm up cameras"""
@@ -155,7 +169,7 @@ class MultiCamDevice:
             if not init_success:
                 error_msg = "Failed to initialize cameras during delay period"
                 logger.error(error_msg)
-                self.status = error_msg
+                self.status = DeviceStatus.ERROR.value
                 logger.debug("Aborting scheduled recording due to initialization failure")
                 return
             
@@ -180,7 +194,7 @@ class MultiCamDevice:
                 if not warmup_success:
                     error_msg = "Failed to warm up cameras during delay period"
                     logger.error(error_msg)
-                    self.status = error_msg
+                    self.status = DeviceStatus.ERROR.value
                     logger.debug("Aborting scheduled recording due to warmup failure")
                     return
                     
@@ -234,7 +248,7 @@ class MultiCamDevice:
             logger.error(error_msg)
             logger.exception("Full exception details:")
             logger.debug(f"Error occurred {time.time() - function_start_time:.3f}s into the function")
-            self.status = error_msg
+            self.status = DeviceStatus.ERROR.value
     
     async def _start_recording_now(self):
         """Actually start the recording process using native recorder"""
@@ -246,12 +260,12 @@ class MultiCamDevice:
                 success = self.native_recorder.start_recording()
                 if success:
                     self.is_recording = True
-                    self.status = "recording"
+                    self.status = DeviceStatus.RECORDING.value
                     logger.info(f"Native recording started successfully: {self.current_file_id}")
                 else:
                     error_msg = "Failed to start native recording"
                     logger.error(error_msg)
-                    self.status = error_msg
+                    self.status = DeviceStatus.ERROR.value
                     self.is_recording = False
             else:
                 # No pre-warmed recorder, initialize from scratch
@@ -270,7 +284,7 @@ class MultiCamDevice:
                 if not init_success:
                     error_msg = "Failed to initialize cameras"
                     logger.error(error_msg)
-                    self.status = error_msg
+                    self.status = DeviceStatus.ERROR.value
                     self.is_recording = False
                     return
                 
@@ -280,7 +294,7 @@ class MultiCamDevice:
                 if not warmup_success:
                     error_msg = "Failed to warm up cameras"
                     logger.error(error_msg)
-                    self.status = error_msg
+                    self.status = DeviceStatus.ERROR.value
                     self.is_recording = False
                     return
                 
@@ -288,19 +302,19 @@ class MultiCamDevice:
                 success = self.native_recorder.start_recording()
                 if success:
                     self.is_recording = True
-                    self.status = "recording"
+                    self.status = DeviceStatus.RECORDING.value
                     logger.info(f"Native recording started successfully: {self.current_file_id}")
                 else:
                     error_msg = "Failed to start native recording after initialization"
                     logger.error(error_msg)
-                    self.status = error_msg
+                    self.status = DeviceStatus.ERROR.value
                     self.is_recording = False
             
         except Exception as e:
             error_msg = f"Failed to start native recording: {e}"
             logger.error(error_msg)
             logger.exception("Full exception details:")
-            self.status = error_msg
+            self.status = DeviceStatus.ERROR.value
             self.is_recording = False
     
     async def stop_recording(self) -> Dict[str, Any]:
@@ -310,7 +324,7 @@ class MultiCamDevice:
         
         if not self.is_recording or not self.native_recorder:
             logger.warning("Stop recording requested but not currently recording")
-            return {"status": "Not recording", "isRecording": False}
+            return {"status": DeviceStatus.ERROR.value, "isRecording": False}
         
         try:
             # Stop the native recorder
@@ -324,11 +338,11 @@ class MultiCamDevice:
             await self._finalize_recording()
             
             self.is_recording = False
-            self.status = "ready"
+            self.status = DeviceStatus.READY.value
             logger.info(f"Recording stopped successfully. File ID: {self.current_file_id}")
             
             response = {
-                "status": "Recording stopped",
+                "status": DeviceStatus.RECORDING_STOPPED.value,
                 "isRecording": False,
                 "fileId": self.current_file_id
             }
@@ -349,7 +363,7 @@ class MultiCamDevice:
             self.status = error_msg
             logger.error(error_msg)
             logger.exception("Full exception details:")
-            return {"status": error_msg, "isRecording": self.is_recording}
+            return {"status": DeviceStatus.ERROR.value, "isRecording": self.is_recording}
     
     async def _finalize_recording(self):
         """Run stereo post-processing (MP4 + stats) and zip results, update file_map."""
