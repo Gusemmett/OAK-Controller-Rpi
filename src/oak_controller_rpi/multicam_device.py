@@ -381,11 +381,18 @@ class MultiCamDevice:
         right_h264 = output_dir / "right.h264"
         left_csv = output_dir / "left.csv"
         right_csv = output_dir / "right.csv"
+        rgb_h264 = output_dir / "rgb.h264"
+        rgb_csv = output_dir / "rgb.csv"
 
         def run_finalize():
             try:
                 if all(p.exists() for p in (left_h264, right_h264, left_csv, right_csv)):
-                    spp = StereoPostProcess(left_h264, left_csv, right_h264, right_csv)
+                    # Check if RGB files exist
+                    rgb_h264_param = rgb_h264 if rgb_h264.exists() else None
+                    rgb_csv_param = rgb_csv if rgb_csv.exists() else None
+                    
+                    spp = StereoPostProcess(left_h264, left_csv, right_h264, right_csv, 
+                                          rgb_h264=rgb_h264_param, rgb_csv=rgb_csv_param)
                     res = spp.finalize(output_dir=output_dir)
                     return res
                 else:

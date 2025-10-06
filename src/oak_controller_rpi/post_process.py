@@ -10,14 +10,15 @@ class StereoPostProcess:
     Inputs:
       left_h264, left_csv  (CSV header: ts_ns,frame_idx)
       right_h264, right_csv
+      rgb_h264, rgb_csv (optional)
     Outputs:
-      left.mp4, right.mp4 with pacing from CSV
+      left.mp4, right.mp4, rgb.mp4 (if provided) with pacing from CSV
     API:
       analyze() -> dict
-      to_mp4(out_left, out_right, fps_left=None, fps_right=None, reencode_fallback=True)
+      to_mp4(out_left, out_right, fps_left=None, fps_right=None, out_rgb=None, fps_rgb=None, reencode_fallback=True)
     """
 
-    def __init__(self, left_h264, left_csv, right_h264, right_csv):
+    def __init__(self, left_h264, left_csv, right_h264, right_csv, rgb_h264=None, rgb_csv=None):
         self.l_h264 = Path(left_h264);  self.l_csv  = Path(left_csv)
         self.r_h264 = Path(right_h264); self.r_csv  = Path(right_csv)
         for p in (self.l_h264, self.l_csv, self.r_h264, self.r_csv):
@@ -28,6 +29,19 @@ class StereoPostProcess:
 
         if len(self.l_ts) < 2 or len(self.r_ts) < 2:
             raise ValueError("Need ≥2 timestamps in each CSV")
+
+        # Optional RGB camera
+        self.has_rgb = rgb_h264 is not None and rgb_csv is not None
+        if self.has_rgb:
+            self.rgb_h264 = Path(rgb_h264); self.rgb_csv = Path(rgb_csv)
+            if self.rgb_h264.exists() and self.rgb_csv.exists():
+                self.rgb_ts, self.rgb_idx = self._load_csv(self.rgb_csv)
+                if len(self.rgb_ts) >= 2:
+                    self.rgb_stats = self._compute_stream_stats(self.rgb_ts, self.rgb_idx)
+                else:
+                    self.has_rgb = False
+            else:
+                self.has_rgb = False
 
         self.left_stats  = self._compute_stream_stats(self.l_ts, self.l_idx)
         self.right_stats = self._compute_stream_stats(self.r_ts, self.r_idx)
@@ -189,7 +203,14 @@ class StereoPostProcess:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def _fps_from_stats(self, side: str) -> float:
-        st = self.left_stats if side == "left" else self.right_stats
+        if side == "left":
+            st = self.left_stats
+        elif side == "right":
+            st = self.right_stats
+        elif side == "rgb":
+            st = self.rgb_stats
+        else:
+            raise ValueError(f"Unknown side: {side}")
         return float(st["fps_median"])
 
     def to_mp4(self,
@@ -197,7 +218,9 @@ class StereoPostProcess:
                out_right: str | Path,
                fps_left: Optional[float] = None,
                fps_right: Optional[float] = None,
-               reencode_fallback: bool = True) -> Tuple[Path, Path]:
+               out_rgb: Optional[str | Path] = None,
+               fps_rgb: Optional[float] = None,
+               reencode_fallback: bool = True) -> Tuple[Path, Path, Optional[Path]]:
         if not self._have_ffmpeg():
             raise RuntimeError("ffmpeg not found in PATH")
 
@@ -223,7 +246,20 @@ class StereoPostProcess:
                 raise RuntimeError(f"Right remux failed:\n{e.stderr.decode(errors='ignore')}") from e
             self._reencode_libx264(self.r_h264, out_right, R_fps)
 
-        return out_left, out_right
+        # RGB (optional)
+        out_rgb_path = None
+        if out_rgb and self.has_rgb:
+            out_rgb_path = Path(out_rgb)
+            out_rgb_path.parent.mkdir(parents=True, exist_ok=True)
+            RGB_fps = fps_rgb if fps_rgb else self._fps_from_stats("rgb")
+            try:
+                self._remux_copy(self.rgb_h264, out_rgb_path, RGB_fps)
+            except subprocess.CalledProcessError as e:
+                if not reencode_fallback:
+                    raise RuntimeError(f"RGB remux failed:\n{e.stderr.decode(errors='ignore')}") from e
+                self._reencode_libx264(self.rgb_h264, out_rgb_path, RGB_fps)
+
+        return out_left, out_right, out_rgb_path
 
     # ---------- Public ----------
 
@@ -233,10 +269,14 @@ class StereoPostProcess:
           {
             'left':  per-stream stats,
             'right': per-stream stats,
+            'rgb':   per-stream stats (if available),
             'pair':  cross-stream skew/jitter/drift + alignment counts
           }
         """
-        return {"left": self.left_stats, "right": self.right_stats, "pair": self.pair_stats}
+        result = {"left": self.left_stats, "right": self.right_stats, "pair": self.pair_stats}
+        if self.has_rgb:
+            result["rgb"] = self.rgb_stats
+        return result
 
     def write_stats_json(self, out_path: str | Path) -> Path:
         """Write analysis stats to a JSON file and return the path."""
@@ -252,12 +292,13 @@ class StereoPostProcess:
                  make_mp4: bool = True,
                  fps_left: Optional[float] = None,
                  fps_right: Optional[float] = None,
+                 fps_rgb: Optional[float] = None,
                  reencode_fallback: bool = True) -> Dict:
         """
         Create outputs in the given directory and zip the result.
         Steps:
-          - optionally create left.mp4/right.mp4 (copy or reencode)
-          - write stereo_stats.json
+          - optionally create left.mp4/right.mp4/rgb.mp4 (copy or reencode)
+          - write recording_stats.json
           - zip the entire output_dir to zip_path (default: sibling .zip)
         Returns a dict with paths and success flags.
         """
@@ -267,6 +308,7 @@ class StereoPostProcess:
         result: Dict[str, object] = {
             "mp4_left": None,
             "mp4_right": None,
+            "mp4_rgb": None,
             "stats_json": None,
             "zip_path": None,
             "mp4_ok": False,
@@ -276,15 +318,20 @@ class StereoPostProcess:
         # MP4 generation
         if make_mp4:
             try:
-                out_left, out_right = self.to_mp4(
+                out_rgb_param = output_dir / "rgb.mp4" if self.has_rgb else None
+                out_left, out_right, out_rgb = self.to_mp4(
                     output_dir / "left.mp4",
                     output_dir / "right.mp4",
                     fps_left=fps_left,
                     fps_right=fps_right,
+                    out_rgb=out_rgb_param,
+                    fps_rgb=fps_rgb,
                     reencode_fallback=reencode_fallback,
                 )
                 result["mp4_left"] = str(out_left)
                 result["mp4_right"] = str(out_right)
+                if out_rgb:
+                    result["mp4_rgb"] = str(out_rgb)
                 result["mp4_ok"] = True
                 # Delete source H264 files after successful conversion
                 try:
@@ -292,7 +339,10 @@ class StereoPostProcess:
                         self.l_h264.unlink()
                     if self.r_h264.exists():
                         self.r_h264.unlink()
-                    logger.info(f"Deleted source H264 files: {self.l_h264}, {self.r_h264}")
+                    if self.has_rgb and self.rgb_h264.exists():
+                        self.rgb_h264.unlink()
+                    logger.info(f"Deleted source H264 files: {self.l_h264}, {self.r_h264}" + 
+                               (f", {self.rgb_h264}" if self.has_rgb else ""))
                 except Exception as e:
                     logger.warning(f"Failed to delete H264 sources: {e}")
             except Exception as e:
@@ -300,7 +350,7 @@ class StereoPostProcess:
 
         # Stats JSON
         try:
-            stats_path = output_dir / "stereo_stats.json"
+            stats_path = output_dir / "recording_stats.json"
             self.write_stats_json(stats_path)
             result["stats_json"] = str(stats_path)
         except Exception as e:

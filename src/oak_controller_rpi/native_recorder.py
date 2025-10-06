@@ -29,14 +29,17 @@ class NativeOAKRecorder:
     def __init__(self,
                  width: int = 1280,
                  height: int = 720,
-                 fps: float = 30.0,
-                 is_camera_upside_down: bool = True,
+                 fps: float = 24.0,
+                 is_camera_upside_down: bool = False,
                  enable_slam: bool = False,
-                 enable_depth: bool = False):
+                 enable_depth: bool = False,
+                 enable_rgb: bool = True):
 
         self.width = width
         self.height = height
         self.fps = fps
+
+        self.rgb_socket = self._parse_socket("CAM_A")
         # Assign sockets based on orientation. Normal: left=B, right=C. Upside down: swap.
         if is_camera_upside_down:
             left_socket_name = "CAM_C"
@@ -50,6 +53,7 @@ class NativeOAKRecorder:
         self.is_camera_upside_down = is_camera_upside_down
         self.enable_slam = enable_slam
         self.enable_depth = enable_depth
+        self.enable_rgb = enable_rgb
 
         # State
         self.state = RecorderState.STOPPED
@@ -71,18 +75,23 @@ class NativeOAKRecorder:
 
         p = dai.Pipeline()
 
-        device = p.getDefaultDevice()
-        try:
-            device.setIrLaserDotProjectorIntensity(0.5)
-        except Exception:
-            logger.info("Device does not support dot projector")
-            pass
+        # device = p.getDefaultDevice()
+        # try:
+        #     device.setIrLaserDotProjectorIntensity(0.5)
+        # except Exception:
+        #     logger.info("Device does not support dot projector")
+        #     pass
 
         camL = p.create(dai.node.Camera).build(self.left_socket, sensorFps=self.fps)
         camR = p.create(dai.node.Camera).build(self.right_socket, sensorFps=self.fps)
 
         outL = camL.requestOutput((self.width, self.height), type=dai.ImgFrame.Type.RAW8, fps=self.fps)
         outR = camR.requestOutput((self.width, self.height), type=dai.ImgFrame.Type.RAW8, fps=self.fps)
+
+        # Optionally create RGB camera if enabled
+        if self.enable_rgb:
+            camRGB = p.create(dai.node.Camera).build(self.rgb_socket, sensorFps=self.fps)
+            outRGB = camRGB.requestOutput((1920, 1080), type=dai.ImgFrame.Type.NV12, fps=self.fps)
 
         # Optionally flip images if the camera is mounted upside down
         sourceL = outL
@@ -100,6 +109,17 @@ class NativeOAKRecorder:
             outR.link(manipR.inputImage)
             sourceR = manipR.out
 
+            if self.enable_rgb:
+                manipRGB = p.create(dai.node.ImageManip)
+                manipRGB.initialConfig.addFlipVertical()
+                manipRGB.initialConfig.addFlipHorizontal()
+                outRGB.link(manipRGB.inputImage)
+                sourceRGB = manipRGB.out
+            else:
+                sourceRGB = None
+        else:
+            sourceRGB = outRGB if self.enable_rgb else None
+
         sync = p.create(dai.node.Sync)
         sourceL.link(sync.inputs["left"])
         sourceR.link(sync.inputs["right"])
@@ -116,6 +136,14 @@ class NativeOAKRecorder:
             profile=dai.VideoEncoderProperties.Profile.H264_MAIN
         )
 
+        # Create RGB encoder if enabled
+        if self.enable_rgb:
+            encRGB = p.create(dai.node.VideoEncoder).build(
+                sourceRGB, frameRate=self.fps,
+                profile=dai.VideoEncoderProperties.Profile.H264_MAIN
+            )
+            encRGB.setBitrateKbps(15000)
+
         # Create IMU node here (after encoders), and pass its output to the SLAM builder
         imu = p.create(dai.node.IMU)
         imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER, dai.IMUSensor.GYROSCOPE_CALIBRATED, dai.IMUSensor.MAGNETOMETER_CALIBRATED, dai.IMUSensor.ROTATION_VECTOR], 200)
@@ -127,6 +155,11 @@ class NativeOAKRecorder:
         loggerL = p.create(TsLogger).build(encL.out)
         loggerR = p.create(TsLogger).build(encR.out)
         imuLogger = p.create(IMUCSVLogger).build(imu.out)
+
+        # Create RGB saver and logger if enabled
+        if self.enable_rgb:
+            saverRGB = p.create(VideoSaver).build(encRGB.out)
+            loggerRGB = p.create(TsLogger).build(encRGB.out)
 
         # === Optional Depth subgraph (StereoDepth only) ===
         depth_nodes = None
@@ -158,6 +191,9 @@ class NativeOAKRecorder:
             "loggerR": loggerR,
             "imuLogger": imuLogger
         }
+        if self.enable_rgb:
+            nodes["saverRGB"] = saverRGB
+            nodes["loggerRGB"] = loggerRGB
         if depth_nodes is not None:
             nodes.update({"depthLogger": depth_nodes.get("depthLogger")})
         if poseLogger is not None:
@@ -264,12 +300,18 @@ class NativeOAKRecorder:
                 slam_csv = output_dir / "slam.csv"
                 imu_csv = output_dir / "imu.csv"
                 depth_dir = output_dir / "depth"
+                rgb_h264 = output_dir / "rgb.h264"
+                rgb_csv = output_dir / "rgb.csv"
 
                 nodes['saverL'].filename = str(left_h264)
                 nodes['saverR'].filename = str(right_h264)
                 nodes['loggerL'].path = str(left_csv)
                 nodes['loggerR'].path = str(right_csv)
                 nodes['imuLogger'].path = str(imu_csv)
+                if 'saverRGB' in nodes:
+                    nodes['saverRGB'].filename = str(rgb_h264)
+                if 'loggerRGB' in nodes:
+                    nodes['loggerRGB'].path = str(rgb_csv)
                 if 'poseLogger' in nodes:
                     nodes['poseLogger'].path = str(slam_csv)
                 if 'depthLogger' in nodes:
@@ -357,7 +399,8 @@ class NativeOAKRecorder:
                 'height': self.height,
                 'fps': self.fps,
                 'enable_slam': self.enable_slam,
-                'enable_depth': self.enable_depth
+                'enable_depth': self.enable_depth,
+                'enable_rgb': self.enable_rgb
             }
         }
     

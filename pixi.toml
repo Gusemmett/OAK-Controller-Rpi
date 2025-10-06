@@ -2,7 +2,7 @@
 authors = ["AngusEmmett <gusemmett@gmail.com>"]
 channels = ["conda-forge"]
 name = "OAK-Controller-Rpi"
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
