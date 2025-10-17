@@ -4,9 +4,15 @@ import asyncio
 import json
 import logging
 import struct
+import time
 from typing import Any, Dict
 
-from .multicam_device import DeviceStatus
+from multicam_common.status import DeviceStatus
+from multicam_common.commands import (
+    CommandMessage, CommandType, StatusResponse,
+    StopRecordingResponse, ErrorResponse, FileResponse,
+    ListFilesResponse, FileMetadata
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,56 +125,126 @@ class MultiCamServer:
     
     async def _process_command(self, message: Dict[str, Any]) -> Any:
         """Process incoming command message"""
-        command = message.get('command')
-        logger.info(f"Processing command: {command}")
-        
-        if command == 'START_RECORDING':
-            timestamp = message.get('timestamp')
-            logger.info(f"START_RECORDING command with timestamp: {timestamp}")
-            return await self.device.start_recording(timestamp)
-        
-        elif command == 'STOP_RECORDING':
-            logger.info("STOP_RECORDING command received")
-            return await self.device.stop_recording()
-        
-        elif command == 'DEVICE_STATUS':
-            logger.debug("DEVICE_STATUS command received")
-            return self.device.get_device_status()
-        
-        elif command == 'HEARTBEAT':
-            logger.debug("HEARTBEAT command received")
-            return {"status": DeviceStatus.COMMAND_RECEIVED.value}
-        
-        elif command == 'GET_VIDEO':
-            file_id = message.get('fileId')
-            logger.info(f"GET_VIDEO command for fileId: {file_id}")
-            if not file_id:
-                return {"status": DeviceStatus.ERROR.value}
-            
-            video_info = self.device.get_video_info(file_id)
-            if not video_info:
-                logger.warning(f"Video file not found: {file_id}")
-                return {"status": DeviceStatus.FILE_NOT_FOUND.value}
-            
-            # Read file data
-            try:
-                with open(video_info['filePath'], 'rb') as f:
+        try:
+            # Parse command using CommandMessage
+            cmd = CommandMessage.from_json(json.dumps(message))
+            logger.info(f"Processing command: {cmd.command}")
+
+            if cmd.command == CommandType.START_RECORDING:
+                logger.info(f"START_RECORDING command with timestamp: {cmd.timestamp}")
+                response = await self.device.start_recording(cmd.timestamp)
+                return json.loads(response.to_json())
+
+            elif cmd.command == CommandType.STOP_RECORDING:
+                logger.info("STOP_RECORDING command received")
+                response = await self.device.stop_recording()
+                return json.loads(response.to_json())
+
+            elif cmd.command == CommandType.DEVICE_STATUS:
+                logger.debug("DEVICE_STATUS command received")
+                response = self.device.get_device_status()
+                return json.loads(response.to_json())
+
+            elif cmd.command == CommandType.HEARTBEAT:
+                logger.debug("HEARTBEAT command received")
+                response = StatusResponse(
+                    deviceId=self.device.device_id,
+                    status=DeviceStatus.COMMAND_RECEIVED.value,
+                    timestamp=time.time()
+                )
+                return json.loads(response.to_json())
+
+            elif cmd.command == CommandType.GET_VIDEO:
+                logger.info(f"GET_VIDEO command for fileName: {cmd.fileName}")
+                if not cmd.fileName:
+                    error = ErrorResponse(
+                        deviceId=self.device.device_id,
+                        status=DeviceStatus.ERROR.value,
+                        timestamp=time.time(),
+                        message="fileName required for GET_VIDEO"
+                    )
+                    return json.loads(error.to_json())
+
+                file_metadata = self.device.get_video_info(cmd.fileName)
+                if not file_metadata:
+                    logger.warning(f"Video file not found: {cmd.fileName}")
+                    error = ErrorResponse(
+                        deviceId=self.device.device_id,
+                        status=DeviceStatus.FILE_NOT_FOUND.value,
+                        timestamp=time.time(),
+                        message=f"File not found: {cmd.fileName}"
+                    )
+                    return json.loads(error.to_json())
+
+                # Read file data
+                file_path = self.device.videos_dir / cmd.fileName
+                with open(file_path, 'rb') as f:
                     file_data = f.read()
-                
-                header = {
-                    "fileId": video_info['fileId'],
-                    "fileName": video_info['fileName'], 
-                    "fileSize": len(file_data)
-                }
-                
-                return (header, file_data)  # Tuple for binary transfer
-                
-            except Exception as e:
-                return {"status": DeviceStatus.ERROR.value}
-        
-        else:
-            logger.warning(f"Unknown command received: {command}")
-            return {"status": DeviceStatus.ERROR.value}
+
+                header = FileResponse(
+                    deviceId=self.device.device_id,
+                    fileName=file_metadata.fileName,
+                    fileSize=file_metadata.fileSize,
+                    status=DeviceStatus.READY.value
+                )
+
+                return (json.loads(header.to_json()), file_data)
+
+            elif cmd.command == CommandType.LIST_FILES:
+                logger.info("LIST_FILES command received")
+                files = []
+                for file_path in self.device.videos_dir.glob("*.zip"):
+                    stat = file_path.stat()
+                    files.append(FileMetadata(
+                        fileName=file_path.name,
+                        fileSize=stat.st_size,
+                        creationDate=stat.st_ctime,
+                        modificationDate=stat.st_mtime
+                    ))
+
+                response = ListFilesResponse(
+                    deviceId=self.device.device_id,
+                    status=DeviceStatus.READY.value,
+                    timestamp=time.time(),
+                    files=files
+                )
+                return json.loads(response.to_json())
+
+            elif cmd.command == CommandType.UPLOAD_TO_CLOUD:
+                logger.info(f"UPLOAD_TO_CLOUD command for fileName: {cmd.fileName}")
+                if not cmd.fileName or not cmd.uploadUrl:
+                    error = ErrorResponse(
+                        deviceId=self.device.device_id,
+                        status=DeviceStatus.ERROR.value,
+                        timestamp=time.time(),
+                        message="fileName and uploadUrl required for UPLOAD_TO_CLOUD"
+                    )
+                    return json.loads(error.to_json())
+
+                # Call actual implementation
+                response = await self.device.upload_to_cloud(cmd.fileName, cmd.uploadUrl)
+                return json.loads(response.to_json())
+
+            else:
+                logger.warning(f"Unknown command received: {cmd.command}")
+                error = ErrorResponse(
+                    deviceId=self.device.device_id,
+                    status=DeviceStatus.ERROR.value,
+                    timestamp=time.time(),
+                    message=f"Unknown command: {cmd.command}"
+                )
+                return json.loads(error.to_json())
+
+        except Exception as e:
+            logger.error(f"Error processing command: {e}")
+            logger.exception("Full exception details:")
+            error = ErrorResponse(
+                deviceId=self.device.device_id,
+                status=DeviceStatus.ERROR.value,
+                timestamp=time.time(),
+                message=str(e)
+            )
+            return json.loads(error.to_json())
     
     async def start(self):
         """Start the TCP server"""

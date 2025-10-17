@@ -6,27 +6,21 @@ import socket
 import time
 import uuid
 import zipfile
-from enum import Enum
+import aiohttp
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List, Union
 
 from zeroconf import ServiceInfo, Zeroconf
+from multicam_common.status import DeviceStatus
+from multicam_common.commands import (
+    CommandType, CommandMessage, StatusResponse,
+    StopRecordingResponse, ErrorResponse, FileResponse,
+    ListFilesResponse, FileMetadata, UploadItem, UploadStatus
+)
+from multicam_common.constants import TCP_PORT
 
 from .native_recorder import NativeOAKRecorder, RecorderState
 from .post_process import StereoPostProcess
-
-
-class DeviceStatus(Enum):
-    """Device status enum matching Swift DeviceStatus schema"""
-    READY = "ready"
-    RECORDING = "recording"
-    STOPPING = "stopping"
-    ERROR = "error"
-    SCHEDULED_RECORDING_ACCEPTED = "scheduled_recording_accepted"
-    RECORDING_STOPPED = "recording_stopped"
-    COMMAND_RECEIVED = "command_received"
-    TIME_NOT_SYNCHRONIZED = "time_not_synchronized"
-    FILE_NOT_FOUND = "file_not_found"
 
 
 logger = logging.getLogger(__name__)
@@ -38,20 +32,22 @@ class MultiCamDevice:
         self.videos_dir = Path(videos_dir)
         self.videos_dir.mkdir(parents=True, exist_ok=True)
         self.enable_slam = enable_slam
-        
+
         # Generate persistent device ID
         self.device_id = self._get_or_create_device_id()
-        
+
         # State
         self.is_recording = False
-        self.current_file_id: Optional[str] = None
+        self.current_file_name: Optional[str] = None
         self.native_recorder: Optional[NativeOAKRecorder] = None
         self.status = DeviceStatus.READY.value
-        
-        # File mapping for GET_VIDEO
-        self.file_map: Dict[str, Path] = {}
-        self._scan_existing_videos()
-        
+
+        # Upload queue infrastructure
+        self.upload_queue: List[UploadItem] = []
+        self.failed_upload_queue: List[UploadItem] = []
+        self.upload_tasks: Dict[str, asyncio.Task] = {}  # fileName -> task
+        self._upload_lock = asyncio.Lock()  # Thread-safe queue operations
+
         # mDNS service
         self.zeroconf = Zeroconf()
         self.service_info = None
@@ -60,18 +56,11 @@ class MultiCamDevice:
         device_id_file = Path.home() / ".multicam_device_id"
         if device_id_file.exists():
             return device_id_file.read_text().strip()
-        
+
         device_id = str(uuid.uuid4())
         device_id_file.write_text(device_id)
         return device_id
-    
-    def _scan_existing_videos(self):
-        """Scan videos directory and populate file_map with ZIP archives"""
-        for zip_file in self.videos_dir.glob("*.zip"):
-            file_id = zip_file.stem
-            self.file_map[file_id] = zip_file
-            logger.debug(f"Found existing video archive: {file_id} -> {zip_file}")
-    
+
     async def start_mdns(self):
         """Start mDNS service advertisement"""
         service_name = f"multiCam-oak-{self.device_id}._multicam._tcp.local."
@@ -110,14 +99,28 @@ class MultiCamDevice:
             await self.zeroconf.async_unregister_service(self.service_info)
             self.service_info = None
         await self.zeroconf.async_close()
-    
-    async def start_recording(self, scheduled_time: Optional[float] = None) -> Dict[str, Any]:
+
+    def _get_battery_level(self) -> Optional[float]:
+        """Get battery level (platform-specific, returns None for RPi)"""
+        # TODO: Implement platform-specific battery reading
+        # For RPi with UPS, read from I2C/GPIO
+        # For now, return None
+        return None
+
+    async def start_recording(self, scheduled_time: Optional[float] = None) -> StatusResponse:
         """Start recording, optionally at scheduled time"""
         logger.info(f"START_RECORDING request received. Current recording state: {self.is_recording}")
-        
+
         if self.is_recording:
             logger.warning("Recording already in progress, rejecting new start request")
-            return {"status": DeviceStatus.RECORDING.value, "isRecording": True}
+            return StatusResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.RECORDING.value,
+                timestamp=time.time(),
+                batteryLevel=self._get_battery_level(),
+                uploadQueue=self.upload_queue,
+                failedUploadQueue=self.failed_upload_queue
+            )
         
         current_time = time.time()
         logger.info(f"Current time: {current_time}, Scheduled time: {scheduled_time}")
@@ -126,24 +129,38 @@ class MultiCamDevice:
             # Schedule recording with camera warmup during delay
             delay = scheduled_time - current_time
             logger.info(f"Scheduling recording to start in {delay:.3f} seconds with camera warmup")
-            
-            # Generate file ID and setup output directory now
-            self.current_file_id = f"video_{int(time.time())}"
-            output_dir = self.videos_dir / self.current_file_id
-            logger.info(f"Pre-generated file ID: {self.current_file_id}")
-            
+
+            # Generate file name and setup output directory now
+            self.current_file_name = f"video_{int(time.time())}.zip"
+            output_dir = self.videos_dir / Path(self.current_file_name).stem
+            logger.info(f"Pre-generated file name: {self.current_file_name}")
+
             asyncio.create_task(self._delayed_start_recording_with_warmup(delay, output_dir))
-            return {"status": DeviceStatus.SCHEDULED_RECORDING_ACCEPTED.value, "isRecording": False}
+            return StatusResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.SCHEDULED_RECORDING_ACCEPTED.value,
+                timestamp=time.time(),
+                batteryLevel=self._get_battery_level(),
+                uploadQueue=self.upload_queue,
+                failedUploadQueue=self.failed_upload_queue
+            )
         else:
             # Start immediately
             logger.info("Starting recording immediately")
             await self._start_recording_now()
-            return {"status": DeviceStatus.COMMAND_RECEIVED.value, "isRecording": self.is_recording}
+            return StatusResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.COMMAND_RECEIVED.value,
+                timestamp=time.time(),
+                batteryLevel=self._get_battery_level(),
+                uploadQueue=self.upload_queue,
+                failedUploadQueue=self.failed_upload_queue
+            )
     
     async def _delayed_start_recording_with_warmup(self, delay: float, output_dir: Path):
         """Start recording after delay, using the delay time to warm up cameras"""
         logger.info("=== SCHEDULED RECORDING WITH CAMERA WARMUP ===")
-        logger.debug(f"File ID: {self.current_file_id}")
+        logger.debug(f"File name: {self.current_file_name}")
         logger.debug(f"Output directory: {output_dir}")
         logger.info(f"Total delay: {delay:.3f}s, using time for camera initialization and warmup")
         
@@ -261,7 +278,7 @@ class MultiCamDevice:
                 if success:
                     self.is_recording = True
                     self.status = DeviceStatus.RECORDING.value
-                    logger.info(f"Native recording started successfully: {self.current_file_id}")
+                    logger.info(f"Native recording started successfully: {self.current_file_name}")
                 else:
                     error_msg = "Failed to start native recording"
                     logger.error(error_msg)
@@ -270,9 +287,9 @@ class MultiCamDevice:
             else:
                 # No pre-warmed recorder, initialize from scratch
                 logger.info("Initializing cameras from scratch (no warmup)")
-                self.current_file_id = f"video_{int(time.time())}"
-                output_dir = self.videos_dir / self.current_file_id
-                logger.info(f"Generated file ID: {self.current_file_id}")
+                self.current_file_name = f"video_{int(time.time())}.zip"
+                output_dir = self.videos_dir / Path(self.current_file_name).stem
+                logger.info(f"Generated file name: {self.current_file_name}")
                 logger.info(f"Output directory: {output_dir}")
                 
                 # Create native recorder
@@ -303,7 +320,7 @@ class MultiCamDevice:
                 if success:
                     self.is_recording = True
                     self.status = DeviceStatus.RECORDING.value
-                    logger.info(f"Native recording started successfully: {self.current_file_id}")
+                    logger.info(f"Native recording started successfully: {self.current_file_name}")
                 else:
                     error_msg = "Failed to start native recording after initialization"
                     logger.error(error_msg)
@@ -317,14 +334,19 @@ class MultiCamDevice:
             self.status = DeviceStatus.ERROR.value
             self.is_recording = False
     
-    async def stop_recording(self) -> Dict[str, Any]:
+    async def stop_recording(self) -> Union[StopRecordingResponse, ErrorResponse]:
         """Stop active recording using native recorder"""
         logger.info("=== STOPPING NATIVE RECORDING PROCESS ===")
         logger.info(f"Current recording state: is_recording={self.is_recording}, recorder={self.native_recorder is not None}")
         
         if not self.is_recording or not self.native_recorder:
             logger.warning("Stop recording requested but not currently recording")
-            return {"status": DeviceStatus.ERROR.value, "isRecording": False}
+            return ErrorResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.ERROR.value,
+                timestamp=time.time(),
+                message="Not currently recording"
+            )
         
         try:
             # Stop the native recorder
@@ -336,19 +358,25 @@ class MultiCamDevice:
             # Create ZIP archive of recorded data
             logger.info("Starting video finalization process - creating ZIP archive")
             await self._finalize_recording()
-            
+
             self.is_recording = False
             self.status = DeviceStatus.READY.value
-            logger.info(f"Recording stopped successfully. File ID: {self.current_file_id}")
-            
-            response = {
-                "status": DeviceStatus.RECORDING_STOPPED.value,
-                "isRecording": False,
-                "fileId": self.current_file_id
-            }
-            
-            temp_file_id = self.current_file_id
-            self.current_file_id = None
+            logger.info(f"Recording stopped successfully. File name: {self.current_file_name}")
+
+            # Get file size
+            file_path = self.videos_dir / self.current_file_name
+            file_size = file_path.stat().st_size if file_path.exists() else 0
+
+            response = StopRecordingResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.RECORDING_STOPPED.value,
+                timestamp=time.time(),
+                fileName=self.current_file_name,
+                fileSize=file_size
+            )
+
+            temp_file_name = self.current_file_name
+            self.current_file_name = None
             
             # Clean up the recorder instance
             if self.native_recorder:
@@ -360,18 +388,23 @@ class MultiCamDevice:
             
         except Exception as e:
             error_msg = f"Error stopping native recording: {e}"
-            self.status = error_msg
+            self.status = DeviceStatus.ERROR.value
             logger.error(error_msg)
             logger.exception("Full exception details:")
-            return {"status": DeviceStatus.ERROR.value, "isRecording": self.is_recording}
+            return ErrorResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.ERROR.value,
+                timestamp=time.time(),
+                message=error_msg
+            )
     
     async def _finalize_recording(self):
-        """Run stereo post-processing (MP4 + stats) and zip results, update file_map."""
-        if not self.current_file_id:
-            logger.warning("No current file ID for finalization")
+        """Run stereo post-processing (MP4 + stats) and zip results."""
+        if not self.current_file_name:
+            logger.warning("No current file name for finalization")
             return
 
-        output_dir = self.videos_dir / self.current_file_id
+        output_dir = self.videos_dir / Path(self.current_file_name).stem
         if not output_dir.exists():
             logger.error(f"Output directory does not exist: {output_dir}")
             return
@@ -410,14 +443,13 @@ class MultiCamDevice:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, run_finalize)
 
-        # Register produced ZIP if present
+        # Log produced ZIP if present
         zip_path = None
         if isinstance(result, dict):
             zp = result.get("zip_path")
             if zp:
                 zip_path = Path(zp)
         if zip_path and zip_path.exists():
-            self.file_map[self.current_file_id] = zip_path
             try:
                 sz_mb = zip_path.stat().st_size / 1024 / 1024
             except Exception:
@@ -426,37 +458,295 @@ class MultiCamDevice:
         else:
             logger.error("Finalization did not produce a ZIP archive")
     
-    def get_device_status(self) -> Dict[str, Any]:
-        """Get current device status including native recorder state"""
-        status_response = {
-            "status": self.status,
-            "isRecording": self.is_recording,
-            "deviceId": self.device_id,
-            "timestamp": time.time()
-        }
-        
-        # Add native recorder state if available
-        if self.native_recorder:
-            recorder_state = self.native_recorder.get_state()
-            status_response["recorderState"] = recorder_state['state']
-            status_response["timing"] = recorder_state.get('timing', {})
-        
-        return status_response
+    def get_device_status(self) -> StatusResponse:
+        """Get current device status"""
+        return StatusResponse(
+            deviceId=self.device_id,
+            status=self.status,
+            timestamp=time.time(),
+            batteryLevel=self._get_battery_level(),
+            uploadQueue=self.upload_queue,
+            failedUploadQueue=self.failed_upload_queue
+        )
     
-    def get_video_info(self, file_id: str) -> Optional[Dict[str, Any]]:
-        """Get video file info for GET_VIDEO"""
-        if file_id not in self.file_map:
-            return None
-        
-        file_path = self.file_map[file_id]
+    def get_video_info(self, file_name: str) -> Optional[FileMetadata]:
+        """Get video file metadata for GET_VIDEO"""
+        file_path = self.videos_dir / file_name
         if not file_path.exists():
             return None
-        
-        return {
-            "fileId": file_id,
-            "fileName": file_path.name,
-            "fileSize": file_path.stat().st_size,
-            "filePath": str(file_path)
-        }
+
+        stat = file_path.stat()
+        return FileMetadata(
+            fileName=file_name,
+            fileSize=stat.st_size,
+            creationDate=stat.st_ctime,
+            modificationDate=stat.st_mtime
+        )
+
+    async def upload_to_cloud(self, file_name: str, upload_url: str) -> Union[StatusResponse, ErrorResponse]:
+        """Queue file upload to cloud using presigned S3 URL"""
+        logger.info(f"=== UPLOAD TO CLOUD REQUEST ===")
+        logger.info(f"File: {file_name}, URL: {upload_url[:50]}...")
+
+        # Validate file exists
+        file_path = self.videos_dir / file_name
+        if not file_path.exists():
+            logger.error(f"File not found: {file_name}")
+            return ErrorResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.FILE_NOT_FOUND.value,
+                timestamp=time.time(),
+                message=f"File not found: {file_name}"
+            )
+
+        # Check if already uploading
+        if file_name in self.upload_tasks:
+            logger.warning(f"Upload already in progress for: {file_name}")
+            return ErrorResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.ERROR.value,
+                timestamp=time.time(),
+                message=f"Upload already in progress for {file_name}"
+            )
+
+        # Check if already in queue
+        async with self._upload_lock:
+            for item in self.upload_queue:
+                if item.fileName == file_name:
+                    logger.warning(f"File already in upload queue: {file_name}")
+                    return ErrorResponse(
+                        deviceId=self.device_id,
+                        status=DeviceStatus.ERROR.value,
+                        timestamp=time.time(),
+                        message=f"File already in upload queue: {file_name}"
+                    )
+
+        # Get file size
+        file_size = file_path.stat().st_size
+        logger.info(f"File size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
+
+        # Create UploadItem
+        upload_item = UploadItem(
+            fileName=file_name,
+            fileSize=file_size,
+            bytesUploaded=0,
+            uploadProgress=0.0,
+            uploadSpeed=0,
+            status=UploadStatus.QUEUED.value,
+            uploadUrl=upload_url,
+            error=None
+        )
+
+        # Add to queue
+        async with self._upload_lock:
+            self.upload_queue.append(upload_item)
+
+        # Start background upload task
+        task = asyncio.create_task(self._upload_file_task(file_name))
+        self.upload_tasks[file_name] = task
+
+        logger.info(f"Upload queued successfully: {file_name}")
+
+        return StatusResponse(
+            deviceId=self.device_id,
+            status=DeviceStatus.UPLOAD_QUEUED.value,
+            timestamp=time.time(),
+            batteryLevel=self._get_battery_level(),
+            uploadQueue=self.upload_queue,
+            failedUploadQueue=self.failed_upload_queue
+        )
+
+    async def _upload_file_task(self, file_name: str) -> None:
+        """Background task that performs the actual upload"""
+        logger.info(f"=== UPLOAD TASK STARTED: {file_name} ===")
+
+        upload_item = None
+
+        try:
+            # Find upload item in queue
+            async with self._upload_lock:
+                for item in self.upload_queue:
+                    if item.fileName == file_name:
+                        upload_item = item
+                        break
+
+            if not upload_item:
+                logger.error(f"Upload item not found in queue: {file_name}")
+                return
+
+            # Update status to UPLOADING
+            async with self._upload_lock:
+                upload_item.status = UploadStatus.UPLOADING.value
+                self.status = DeviceStatus.UPLOADING.value
+
+            logger.info(f"Starting upload: {file_name}")
+
+            # Perform the upload
+            file_path = self.videos_dir / file_name
+            await self._upload_to_s3(file_path, upload_item)
+
+            # Success - delete file and remove from queue
+            logger.info(f"Upload completed successfully: {file_name}")
+            await self._delete_uploaded_file(file_name)
+
+            async with self._upload_lock:
+                self.upload_queue.remove(upload_item)
+                self.status = DeviceStatus.READY.value
+
+            logger.info(f"File deleted and removed from queue: {file_name}")
+
+        except Exception as e:
+            error_msg = f"Upload failed: {str(e)}"
+            logger.error(f"{error_msg} for file: {file_name}")
+            logger.exception("Full exception details:")
+
+            # Move to failed queue
+            if upload_item:
+                async with self._upload_lock:
+                    upload_item.status = UploadStatus.FAILED.value
+                    upload_item.error = error_msg
+
+                    # Remove from upload queue
+                    if upload_item in self.upload_queue:
+                        self.upload_queue.remove(upload_item)
+
+                    # Add to failed queue
+                    self.failed_upload_queue.append(upload_item)
+
+                    self.status = DeviceStatus.UPLOAD_FAILED.value
+
+                logger.warning(f"Upload moved to failed queue: {file_name}")
+
+        finally:
+            # Cleanup task reference
+            if file_name in self.upload_tasks:
+                del self.upload_tasks[file_name]
+
+            logger.info(f"=== UPLOAD TASK ENDED: {file_name} ===")
+
+    async def _upload_to_s3(self, file_path: Path, upload_item: UploadItem) -> None:
+        """Upload file to S3 with progress tracking"""
+        CHUNK_SIZE = 65536  # 64KB chunks for progress updates
+        start_time = time.time()
+
+        logger.info(f"Starting S3 upload: {file_path.name}, size: {upload_item.fileSize} bytes")
+
+        try:
+            # Read file into memory (S3 doesn't support chunked transfer encoding)
+            # For large files, we read in chunks and track progress
+            logger.debug(f"Reading file into memory: {file_path}")
+            file_data = bytearray()
+            bytes_read = 0
+
+            with open(file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    file_data.extend(chunk)
+                    bytes_read += len(chunk)
+
+                    # Update progress during read
+                    if bytes_read % (CHUNK_SIZE * 10) == 0:  # Every 640KB
+                        logger.debug(f"Read {bytes_read / 1024 / 1024:.2f} MB")
+
+            logger.debug(f"File read complete: {len(file_data)} bytes")
+
+            # Perform HTTP PUT request
+            # S3 requires Content-Length and doesn't support chunked transfer encoding
+            # Must send bytes directly (not generator) to avoid chunked encoding
+            timeout = aiohttp.ClientTimeout(total=600)  # 10 minute timeout
+            file_bytes = bytes(file_data)
+
+            # Update progress to show upload starting
+            await self._update_upload_progress(
+                upload_item.fileName,
+                len(file_bytes),
+                0.01  # Small elapsed time to show starting
+            )
+
+            logger.debug(f"Starting PUT request to S3: {len(file_bytes)} bytes")
+
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Note: Skip auto headers that might interfere with signature
+                # Send bytes directly (not generator) to avoid chunked encoding
+                async with session.put(
+                    upload_item.uploadUrl,
+                    data=file_bytes,
+                    skip_auto_headers=['content-type']
+                ) as response:
+                    if response.status != 200:
+                        error_msg = f"HTTP {response.status}: {await response.text()}"
+                        logger.error(f"S3 upload failed: {error_msg}")
+                        raise Exception(error_msg)
+
+                    logger.info(f"S3 upload successful: {file_path.name}")
+
+            # Final progress update
+            elapsed = time.time() - start_time
+            await self._update_upload_progress(
+                upload_item.fileName,
+                len(file_bytes),
+                elapsed
+            )
+
+            # Log final statistics
+            avg_speed = len(file_data) / elapsed if elapsed > 0 else 0
+            logger.info(f"Upload stats: {len(file_data)} bytes in {elapsed:.2f}s "
+                       f"(avg speed: {avg_speed / 1024 / 1024:.2f} MB/s)")
+
+        except aiohttp.ClientError as e:
+            error_msg = f"Network error during upload: {str(e)}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+        except FileNotFoundError:
+            error_msg = f"File deleted during upload: {file_path}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+        except Exception as e:
+            logger.error(f"Unexpected error during upload: {e}")
+            raise
+
+    async def _update_upload_progress(self, file_name: str, bytes_uploaded: int, elapsed: float) -> None:
+        """Update UploadItem progress fields (thread-safe)"""
+        async with self._upload_lock:
+            for item in self.upload_queue:
+                if item.fileName == file_name:
+                    item.bytesUploaded = bytes_uploaded
+                    item.uploadProgress = (bytes_uploaded / item.fileSize) * 100.0 if item.fileSize > 0 else 0.0
+                    item.uploadSpeed = int(bytes_uploaded / elapsed) if elapsed > 0 else 0
+
+                    # Log progress at 25%, 50%, 75% milestones
+                    progress = item.uploadProgress
+                    if (progress >= 25 and progress < 26) or \
+                       (progress >= 50 and progress < 51) or \
+                       (progress >= 75 and progress < 76):
+                        logger.info(f"Upload progress: {file_name} - {progress:.1f}% "
+                                   f"({bytes_uploaded / 1024 / 1024:.2f} MB, "
+                                   f"speed: {item.uploadSpeed / 1024 / 1024:.2f} MB/s)")
+                    break
+
+    async def _delete_uploaded_file(self, file_name: str) -> None:
+        """Delete ZIP and source directory after successful upload"""
+        import shutil
+
+        try:
+            # Delete ZIP file
+            zip_path = self.videos_dir / file_name
+            if zip_path.exists():
+                zip_path.unlink()
+                logger.info(f"Deleted uploaded file: {zip_path}")
+            else:
+                logger.warning(f"ZIP file not found for deletion: {zip_path}")
+
+            # Delete source directory (e.g., video_123/ for video_123.zip)
+            source_dir = self.videos_dir / Path(file_name).stem
+            if source_dir.exists() and source_dir.is_dir():
+                shutil.rmtree(source_dir)
+                logger.info(f"Deleted source directory: {source_dir}")
+
+        except Exception as e:
+            # Log but don't raise - file deletion failure shouldn't fail the upload
+            logger.warning(f"Error deleting files for {file_name}: {e}")
 
 

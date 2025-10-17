@@ -18,3 +18,7 @@ zeroconf = ">=0.147.2,<0.148"
 aiofiles = ">=24.1.0,<25"
 rerun-sdk = ">=0.24.1,<0.25"
 pip = ">=25.2,<26"
+aiohttp = ">=3.9.0,<4"
+
+[pypi-dependencies]
+multicam-common = { path = "../multiCamCommon/python", editable = true }
