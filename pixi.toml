@@ -21,4 +21,4 @@ pip = ">=25.2,<26"
 aiohttp = ">=3.9.0,<4"
 
 [pypi-dependencies]
-multicam-common = { path = "../multiCamCommon/python", editable = true }
+multicam-common = { git = "https://github.com/Gusemmett/multiCamCommon.git", subdirectory = "python" }

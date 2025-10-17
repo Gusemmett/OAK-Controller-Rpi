@@ -310,7 +310,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/zlib-1.3.1-h86ecc28_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/zstandard-0.25.0-py313h62ef0ea_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/zstd-1.5.7-hbcf94c1_2.conda
-      - pypi: ../multiCamCommon/python
+      - pypi: git+https://github.com/Gusemmett/multiCamCommon.git?subdirectory=python#6b2b6815300061cdafba72e204abbdfdb88b572e
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiofiles-24.1.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/aiohappyeyeballs-2.6.1-pyhd8ed1ab_0.conda
@@ -557,7 +557,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zlib-1.3.1-h8359307_2.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstandard-0.24.0-py313hff09f02_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-h6491c7d_2.conda
-      - pypi: ../multiCamCommon/python
+      - pypi: git+https://github.com/Gusemmett/multiCamCommon.git?subdirectory=python#6b2b6815300061cdafba72e204abbdfdb88b572e
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-2_gnu.tar.bz2
   build_number: 16
@@ -5190,17 +5190,15 @@ packages:
   purls: []
   size: 558708
   timestamp: 1730581372400
-- pypi: ../multiCamCommon/python
+- pypi: git+https://github.com/Gusemmett/multiCamCommon.git?subdirectory=python#6b2b6815300061cdafba72e204abbdfdb88b572e
   name: multicam-common
   version: 1.1.0
-  sha256: 3b6bd28a556f760eafbec438dcd265a4fc8f609b021a171638242b0140f9695f
   requires_dist:
   - pytest>=7.0 ; extra == 'dev'
   - pytest-cov>=4.0 ; extra == 'dev'
   - black>=23.0 ; extra == 'dev'
   - mypy>=1.0 ; extra == 'dev'
   requires_python: '>=3.8'
-  editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/multidict-6.6.3-py313h857f82b_0.conda
   sha256: c43f1cacd97d9c1cff8f78c62402adf84aa350534d70cfa38b86df889dd45dc3
   md5: d371b447b946cc3b5fa7739c765f2cd9

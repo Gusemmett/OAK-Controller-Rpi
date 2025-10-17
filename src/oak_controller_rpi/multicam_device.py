@@ -626,53 +626,66 @@ class MultiCamDevice:
 
     async def _upload_to_s3(self, file_path: Path, upload_item: UploadItem) -> None:
         """Upload file to S3 with progress tracking"""
-        CHUNK_SIZE = 65536  # 64KB chunks for progress updates
+        import io
+
         start_time = time.time()
 
         logger.info(f"Starting S3 upload: {file_path.name}, size: {upload_item.fileSize} bytes")
 
         try:
             # Read file into memory (S3 doesn't support chunked transfer encoding)
-            # For large files, we read in chunks and track progress
             logger.debug(f"Reading file into memory: {file_path}")
-            file_data = bytearray()
-            bytes_read = 0
-
             with open(file_path, 'rb') as f:
-                while True:
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    file_data.extend(chunk)
-                    bytes_read += len(chunk)
-
-                    # Update progress during read
-                    if bytes_read % (CHUNK_SIZE * 10) == 0:  # Every 640KB
-                        logger.debug(f"Read {bytes_read / 1024 / 1024:.2f} MB")
+                file_data = f.read()
 
             logger.debug(f"File read complete: {len(file_data)} bytes")
 
+            # Create a custom file-like object that tracks progress as it's read
+            class ProgressBytesIO(io.BytesIO):
+                """BytesIO that calls progress callback as data is read"""
+                def __init__(self, data, progress_callback):
+                    super().__init__(data)
+                    self.progress_callback = progress_callback
+                    self.bytes_read = 0
+                    self.total_size = len(data)
+                    self.last_update = 0
+
+                def read(self, size=-1):
+                    chunk = super().read(size)
+                    if chunk:
+                        self.bytes_read += len(chunk)
+                        # Update every 640KB to avoid excessive updates
+                        if self.bytes_read - self.last_update >= 655360 or self.bytes_read == self.total_size:
+                            self.last_update = self.bytes_read
+                            if self.progress_callback:
+                                self.progress_callback(self.bytes_read, self.total_size)
+                    return chunk
+
+            # Progress callback function
+            def progress_callback(bytes_uploaded, total_bytes):
+                elapsed = time.time() - start_time
+                # Schedule async update in event loop
+                asyncio.create_task(self._update_upload_progress(
+                    upload_item.fileName,
+                    bytes_uploaded,
+                    elapsed
+                ))
+
+            # Create progress-tracking file object
+            progress_file = ProgressBytesIO(file_data, progress_callback)
+
+            logger.debug(f"Starting PUT request to S3: {len(file_data)} bytes")
+
             # Perform HTTP PUT request
             # S3 requires Content-Length and doesn't support chunked transfer encoding
-            # Must send bytes directly (not generator) to avoid chunked encoding
             timeout = aiohttp.ClientTimeout(total=600)  # 10 minute timeout
-            file_bytes = bytes(file_data)
-
-            # Update progress to show upload starting
-            await self._update_upload_progress(
-                upload_item.fileName,
-                len(file_bytes),
-                0.01  # Small elapsed time to show starting
-            )
-
-            logger.debug(f"Starting PUT request to S3: {len(file_bytes)} bytes")
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 # Note: Skip auto headers that might interfere with signature
-                # Send bytes directly (not generator) to avoid chunked encoding
+                # Pass file-like object that will be read by aiohttp
                 async with session.put(
                     upload_item.uploadUrl,
-                    data=file_bytes,
+                    data=progress_file,
                     skip_auto_headers=['content-type']
                 ) as response:
                     if response.status != 200:
@@ -686,7 +699,7 @@ class MultiCamDevice:
             elapsed = time.time() - start_time
             await self._update_upload_progress(
                 upload_item.fileName,
-                len(file_bytes),
+                len(file_data),
                 elapsed
             )
 
