@@ -253,6 +253,7 @@ class NativeOAKRecorder:
                     "device_mxid": cal_device.getMxId() if hasattr(cal_device, "getMxId") else None,
                     "right": cam_block(self.left_socket),
                     "left": cam_block(self.right_socket),
+                    "rgb": cam_block(self.rgb_socket),
                 }
 
                 # Extrinsics left->right unchanged
@@ -263,6 +264,16 @@ class NativeOAKRecorder:
                             R = [row[:3] for row in E[:3]]
                             t = [E[0][3], E[1][3], E[2][3]]
                             data["extrinsics_left_to_right"] = {"R": R, "T": t, "matrix_4x4": E}
+                    except Exception:
+                        pass
+
+                    # Extrinsics left->rgb
+                    try:
+                        E = cal.getCameraExtrinsics(self.right_socket, self.rgb_socket)
+                        if E:
+                            R = [row[:3] for row in E[:3]]
+                            t = [E[0][3], E[1][3], E[2][3]]
+                            data["extrinsics_left_to_rgb"] = {"R": R, "T": t, "matrix_4x4": E}
                     except Exception:
                         pass
         except Exception as e:
