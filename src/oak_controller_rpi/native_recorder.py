@@ -217,8 +217,12 @@ class NativeOAKRecorder:
                 logger.info(cal)
                 logger.info(cal.getStereoRightCameraId())
 
-                def cam_block(sock):
-                    # Intrinsics
+                device_mxid = cal_device.getMxId() if hasattr(cal_device, "getMxId") else "UNKNOWN"
+                
+                def build_camera_intrinsics(sock, positional_layout):
+                    """Build camera intrinsics in new format."""
+                    # Get intrinsics matrix
+                    K = None
                     if hasattr(cal, "getCameraIntrinsics"):
                         K = cal.getCameraIntrinsics(sock, self.width, self.height)
                     elif hasattr(cal, "getCameraMatrix"):
@@ -226,56 +230,133 @@ class NativeOAKRecorder:
                             K = cal.getCameraMatrix(sock, self.width, self.height)
                         except Exception:
                             K = cal.getCameraMatrix(sock)
-                    else:
-                        K = None
-
-                    # Distortion
+                    
+                    # Get distortion coefficients
                     dist = None
                     for name in ("getDistortionCoefficients", "getDistortionCoeffs", "getDistortion"):
                         if hasattr(cal, name):
                             dist = getattr(cal, name)(sock)
                             break
-
+                    
                     fov = cal.getFov(sock) if hasattr(cal, "getFov") else None
-
-                    cam = {
-                        "socket": getattr(sock, "name", str(sock)),
-                        "width": self.width,
-                        "height": self.height,
-                        "intrinsics": K,
-                        "distortion": dist,
-                        "fov_deg": fov,
+                    socket_name = getattr(sock, "name", str(sock))
+                    
+                    # Extract focal lengths and principal point from intrinsics matrix
+                    lens_intrinsics = {
+                        "available": False
                     }
-
-                    return cam
-
-                data = {
-                    "device_mxid": cal_device.getMxId() if hasattr(cal_device, "getMxId") else None,
-                    "right": cam_block(self.left_socket),
-                    "left": cam_block(self.right_socket),
-                    "rgb": cam_block(self.rgb_socket),
-                }
-
-                # Extrinsics left->right unchanged
+                    if K is not None:
+                        lens_intrinsics = {
+                            "focal_length_x": float(K[0][0]),
+                            "focal_length_y": float(K[1][1]),
+                            "principal_point_x": float(K[0][2]),
+                            "principal_point_y": float(K[1][2]),
+                            "skew": float(K[0][1]),
+                            "available": True
+                        }
+                    
+                    # Build distortion object
+                    distortion = {
+                        "coefficients": dist if dist is not None else None,
+                        "available": dist is not None
+                    }
+                    
+                    # Build sensor info (placeholder values as OAK doesn't provide these)
+                    sensor_info = {
+                        "physical_size_mm": {
+                            "width": None,
+                            "height": None
+                        },
+                        "active_array_size": {
+                            "left": 0,
+                            "top": 0,
+                            "right": self.width,
+                            "bottom": self.height,
+                            "width": self.width,
+                            "height": self.height
+                        },
+                        "pixel_array_size": {
+                            "width": self.width,
+                            "height": self.height
+                        }
+                    }
+                    
+                    # Build lens info
+                    lens_info = {
+                        "focal_length_mm": None,
+                        "fov_deg": fov
+                    }
+                    
+                    return {
+                        "camera_id": socket_name,
+                        "timestamp": None,
+                        "camera_metadata": {
+                            "lens_facing": "BACK",
+                            "hardware_level": None
+                        },
+                        "lens_intrinsics": lens_intrinsics,
+                        "distortion": distortion,
+                        "sensor_info": sensor_info,
+                        "lens_info": lens_info,
+                        "capture_resolution": {
+                            "width": self.width,
+                            "height": self.height
+                        },
+                        "positional_layout": positional_layout
+                    }
+                
+                # Build intrinsics array for all three cameras
+                intrinsics = [
+                    build_camera_intrinsics(self.right_socket, "left"),   # left camera
+                    build_camera_intrinsics(self.left_socket, "right"),   # right camera
+                    build_camera_intrinsics(self.rgb_socket, "center")    # rgb camera
+                ]
+                
+                # Build extrinsics array
+                extrinsics = []
+                
                 if hasattr(cal, "getCameraExtrinsics"):
+                    # Extrinsics left->right
                     try:
                         E = cal.getCameraExtrinsics(self.right_socket, self.left_socket)
                         if E:
                             R = [row[:3] for row in E[:3]]
                             t = [E[0][3], E[1][3], E[2][3]]
-                            data["extrinsics_left_to_right"] = {"R": R, "T": t, "matrix_4x4": E}
+                            extrinsics.append({
+                                "type": "left_to_right",
+                                "from": getattr(self.right_socket, "name", str(self.right_socket)),
+                                "to": getattr(self.left_socket, "name", str(self.left_socket)),
+                                "R": R,
+                                "T": t,
+                                "matrix_4x4": E
+                            })
                     except Exception:
                         pass
-
+                    
                     # Extrinsics left->rgb
                     try:
                         E = cal.getCameraExtrinsics(self.right_socket, self.rgb_socket)
                         if E:
                             R = [row[:3] for row in E[:3]]
                             t = [E[0][3], E[1][3], E[2][3]]
-                            data["extrinsics_left_to_rgb"] = {"R": R, "T": t, "matrix_4x4": E}
+                            extrinsics.append({
+                                "type": "left_to_rgb",
+                                "from": getattr(self.right_socket, "name", str(self.right_socket)),
+                                "to": getattr(self.rgb_socket, "name", str(self.rgb_socket)),
+                                "R": R,
+                                "T": t,
+                                "matrix_4x4": E
+                            })
                     except Exception:
                         pass
+                
+                # Build final data structure
+                data = {
+                    "device_id": f"OAK - {device_mxid}",
+                    "intrinsics": intrinsics,
+                    "extrinsics": extrinsics
+                }
+                
         except Exception as e:
             logger.error(f"Failed to read calibration from device: {e}")
             data = {"error": f"Failed to read calibration from device: {e}"}

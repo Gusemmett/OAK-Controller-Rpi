@@ -189,7 +189,7 @@ def _print_stream_stats(csv_path, label=None):
         print(f"{name}: error: {e}")
 
 # add anywhere above main()
-def dump_calibration(outdir, width, height, left_sock, right_sock):
+def dump_calibration(outdir, width, height, left_sock, right_sock, rgb_sock=None):
     path = os.path.join(outdir, "calibration.json")
     data = {}
     try:
@@ -230,6 +230,10 @@ def dump_calibration(outdir, width, height, left_sock, right_sock):
                 "right": cam(right_sock),
             }
 
+            # Add RGB camera if provided
+            if rgb_sock is not None:
+                data["rgb"] = cam(rgb_sock)
+
             # Extrinsics (left -> right)
             if hasattr(cal, "getCameraExtrinsics"):
                 try:
@@ -240,6 +244,17 @@ def dump_calibration(outdir, width, height, left_sock, right_sock):
                         data["extrinsics_left_to_right"] = {"R": R, "T": t, "matrix_4x4": E}
                 except Exception:
                     pass
+
+                # Extrinsics (left -> rgb)
+                if rgb_sock is not None:
+                    try:
+                        E = cal.getCameraExtrinsics(left_sock, rgb_sock)
+                        if E:
+                            R = [row[:3] for row in E[:3]]
+                            t = [E[0][3], E[1][3], E[2][3]]
+                            data["extrinsics_left_to_rgb"] = {"R": R, "T": t, "matrix_4x4": E}
+                    except Exception:
+                        pass
     except Exception as e:
         data = {"error": f"failed to read calibration: {e}"}
 
@@ -270,6 +285,7 @@ def main():
 
     left_sock = parse_socket(args.left_socket)
     right_sock = parse_socket(args.right_socket)
+    rgb_sock = parse_socket("CAM_A")
 
     os.makedirs(args.outdir, exist_ok=True)
     left_h265  = os.path.join(args.outdir, "left.h265")
@@ -279,7 +295,7 @@ def main():
     imu_csv    = os.path.join(args.outdir, "imu.csv")
 
     # Save camera calibration before starting the pipeline
-    dump_calibration(args.outdir, args.width, args.height, left_sock, right_sock)
+    dump_calibration(args.outdir, args.width, args.height, left_sock, right_sock, rgb_sock)
  
     pipeline, saverL, saverR, loggerL, loggerR, imu_saver = build_pipeline(
         width=args.width,
