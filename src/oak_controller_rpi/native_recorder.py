@@ -91,7 +91,7 @@ class NativeOAKRecorder:
         # Optionally create RGB camera if enabled
         if self.enable_rgb:
             camRGB = p.create(dai.node.Camera).build(self.rgb_socket, sensorFps=self.fps)
-            outRGB = camRGB.requestOutput((1920, 1080), type=dai.ImgFrame.Type.NV12, fps=self.fps)
+            outRGB = camRGB.requestOutput((1280, 720), type=dai.ImgFrame.Type.NV12, fps=self.fps)
 
         # Optionally flip images if the camera is mounted upside down
         sourceL = outL
