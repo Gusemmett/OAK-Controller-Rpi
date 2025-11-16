@@ -47,6 +47,7 @@ class MultiCamDevice:
         self.failed_upload_queue: List[UploadItem] = []
         self.upload_tasks: Dict[str, asyncio.Task] = {}  # fileName -> task
         self._upload_lock = asyncio.Lock()  # Thread-safe queue operations
+        self.upload_iam_credentials: Dict[str, Dict[str, str]] = {}  # fileName -> IAM credentials
 
         # mDNS service
         self.zeroconf = Zeroconf()
@@ -483,10 +484,35 @@ class MultiCamDevice:
             modificationDate=stat.st_mtime
         )
 
-    async def upload_to_cloud(self, file_name: str, upload_url: str) -> Union[StatusResponse, ErrorResponse]:
-        """Queue file upload to cloud using presigned S3 URL"""
+    async def upload_to_cloud(
+        self,
+        file_name: str,
+        upload_url: Optional[str] = None,
+        s3_bucket: Optional[str] = None,
+        s3_key: Optional[str] = None,
+        access_key_id: Optional[str] = None,
+        secret_access_key: Optional[str] = None,
+        session_token: Optional[str] = None,
+        region: Optional[str] = None
+    ) -> Union[StatusResponse, ErrorResponse]:
+        """Queue file upload to cloud using presigned S3 URL or IAM credentials"""
         logger.info(f"=== UPLOAD TO CLOUD REQUEST ===")
-        logger.info(f"File: {file_name}, URL: {upload_url[:50]}...")
+
+        # Determine authentication method
+        using_iam = all([s3_bucket, s3_key, access_key_id, secret_access_key, session_token, region])
+
+        if using_iam:
+            logger.info(f"File: {file_name}, Bucket: {s3_bucket}, Key: {s3_key}, Method: IAM")
+        elif upload_url:
+            logger.info(f"File: {file_name}, URL: {upload_url[:50]}..., Method: Presigned URL")
+        else:
+            logger.error("No authentication credentials provided")
+            return ErrorResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.ERROR.value,
+                timestamp=time.time(),
+                message="Missing authentication credentials (uploadUrl or IAM credentials)"
+            )
 
         # Validate file exists
         file_path = self.videos_dir / file_name
@@ -525,6 +551,20 @@ class MultiCamDevice:
         file_size = file_path.stat().st_size
         logger.info(f"File size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
 
+        # Store IAM credentials if provided
+        if using_iam:
+            self.upload_iam_credentials[file_name] = {
+                'bucket': s3_bucket,
+                'key': s3_key,
+                'access_key_id': access_key_id,
+                'secret_access_key': secret_access_key,
+                'session_token': session_token,
+                'region': region
+            }
+            display_url = f"s3://{s3_bucket}/{s3_key}"
+        else:
+            display_url = upload_url
+
         # Create UploadItem
         upload_item = UploadItem(
             fileName=file_name,
@@ -533,7 +573,7 @@ class MultiCamDevice:
             uploadProgress=0.0,
             uploadSpeed=0,
             status=UploadStatus.QUEUED.value,
-            uploadUrl=upload_url,
+            uploadUrl=display_url,
             error=None
         )
 
@@ -581,9 +621,15 @@ class MultiCamDevice:
 
             logger.info(f"Starting upload: {file_name}")
 
-            # Perform the upload
+            # Perform the upload - route to appropriate method
             file_path = self.videos_dir / file_name
-            await self._upload_to_s3(file_path, upload_item)
+
+            # Check if using IAM credentials
+            if file_name in self.upload_iam_credentials:
+                creds = self.upload_iam_credentials[file_name]
+                await self._upload_to_s3_with_iam(file_path, upload_item, creds)
+            else:
+                await self._upload_to_s3(file_path, upload_item)
 
             # Success - delete file and remove from queue
             logger.info(f"Upload completed successfully: {file_name}")
@@ -592,6 +638,10 @@ class MultiCamDevice:
             async with self._upload_lock:
                 self.upload_queue.remove(upload_item)
                 self.status = DeviceStatus.READY.value
+
+            # Cleanup IAM credentials
+            if file_name in self.upload_iam_credentials:
+                del self.upload_iam_credentials[file_name]
 
             logger.info(f"File deleted and removed from queue: {file_name}")
 
@@ -618,9 +668,13 @@ class MultiCamDevice:
                 logger.warning(f"Upload moved to failed queue: {file_name}")
 
         finally:
-            # Cleanup task reference
+            # Cleanup task reference and IAM credentials
             if file_name in self.upload_tasks:
                 del self.upload_tasks[file_name]
+
+            # Cleanup IAM credentials (in case of failure)
+            if file_name in self.upload_iam_credentials:
+                del self.upload_iam_credentials[file_name]
 
             logger.info(f"=== UPLOAD TASK ENDED: {file_name} ===")
 
@@ -718,6 +772,107 @@ class MultiCamDevice:
             raise Exception(error_msg)
         except Exception as e:
             logger.error(f"Unexpected error during upload: {e}")
+            raise
+
+    async def _upload_to_s3_with_iam(self, file_path: Path, upload_item: UploadItem, credentials: Dict[str, str]) -> None:
+        """Upload file to S3 using IAM credentials with multipart support via boto3"""
+        import boto3
+        from boto3.s3.transfer import TransferConfig
+        from botocore.exceptions import ClientError
+
+        start_time = time.time()
+        bucket = credentials['bucket']
+        key = credentials['key']
+        region = credentials['region']
+
+        logger.info(f"Starting S3 IAM upload: {file_path.name}, size: {upload_item.fileSize} bytes")
+        logger.info(f"Bucket: {bucket}, Key: {key}, Region: {region}")
+
+        # Configure multipart upload settings
+        config = TransferConfig(
+            multipart_threshold=8 * 1024 * 1024,  # 8MB - files larger trigger multipart
+            multipart_chunksize=8 * 1024 * 1024,  # 8MB per part
+            max_concurrency=10,  # Up to 10 concurrent uploads
+            use_threads=True  # Use threading for multipart uploads
+        )
+
+        # Get event loop reference for use in callback
+        loop = asyncio.get_running_loop()
+
+        # Progress callback for boto3
+        bytes_uploaded_total = [0]  # Use list to allow modification in nested function
+
+        def progress_callback(bytes_uploaded_chunk):
+            """Called by boto3 for each chunk uploaded"""
+            bytes_uploaded_total[0] += bytes_uploaded_chunk
+            elapsed = time.time() - start_time
+
+            # Schedule async update in event loop from thread
+            asyncio.run_coroutine_threadsafe(
+                self._update_upload_progress(
+                    upload_item.fileName,
+                    bytes_uploaded_total[0],
+                    elapsed
+                ),
+                loop
+            )
+
+        try:
+            # Create S3 client with temporary credentials
+            logger.debug(f"Creating S3 client with IAM credentials")
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=credentials['access_key_id'],
+                aws_secret_access_key=credentials['secret_access_key'],
+                aws_session_token=credentials['session_token'],
+                region_name=region
+            )
+
+            # Execute upload in thread pool to avoid blocking async event loop
+            # boto3 is synchronous, so we run it in an executor
+            logger.debug(f"Starting boto3 upload (multipart threshold: 8MB)")
+            await loop.run_in_executor(
+                None,  # Use default thread pool
+                lambda: s3_client.upload_file(
+                    str(file_path),
+                    bucket,
+                    key,
+                    Config=config,
+                    Callback=progress_callback
+                )
+            )
+
+            logger.info(f"S3 IAM upload successful: {file_path.name}")
+
+            # Final progress update
+            elapsed = time.time() - start_time
+            await self._update_upload_progress(
+                upload_item.fileName,
+                upload_item.fileSize,
+                elapsed
+            )
+
+            # Log final statistics
+            avg_speed = upload_item.fileSize / elapsed if elapsed > 0 else 0
+            logger.info(f"Upload stats: {upload_item.fileSize} bytes in {elapsed:.2f}s "
+                       f"(avg speed: {avg_speed / 1024 / 1024:.2f} MB/s)")
+
+            # Check if multipart was used
+            if upload_item.fileSize > config.multipart_threshold:
+                num_parts = (upload_item.fileSize + config.multipart_chunksize - 1) // config.multipart_chunksize
+                logger.info(f"Multipart upload used: {num_parts} parts of {config.multipart_chunksize / 1024 / 1024:.1f} MB each")
+
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            error_msg = f"AWS S3 error ({error_code}): {str(e)}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+        except FileNotFoundError:
+            error_msg = f"File deleted during upload: {file_path}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+        except Exception as e:
+            logger.error(f"Unexpected error during IAM upload: {e}")
             raise
 
     async def _update_upload_progress(self, file_name: str, bytes_uploaded: int, elapsed: float) -> None:

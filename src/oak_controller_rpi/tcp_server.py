@@ -25,7 +25,7 @@ class MultiCamServer:
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle client connection"""
         client_addr = writer.get_extra_info('peername')
-        logger.info(f"Client connected: {client_addr}")
+        logger.debug(f"Client connected: {client_addr}")
         self.clients.add(writer)
         
         try:
@@ -43,16 +43,17 @@ class MultiCamServer:
                 if first_bytes[0] == ord('{'):
                     # Raw JSON protocol (like iOS)
                     logger.debug(f"Using raw JSON protocol from {client_addr}")
-                    
+
                     # Read rest of JSON message
-                    remaining_data = await reader.read(1024)  # Read up to 1KB more
+                    # Increased buffer size to handle large IAM credentials (session tokens can be long)
+                    remaining_data = await reader.read(8192)  # Read up to 8KB more
                     full_data = first_bytes + remaining_data
-                    
+
                     # Find the end of JSON message
                     try:
                         json_str = full_data.decode('utf-8').rstrip('\x00\n\r')
                         message = json.loads(json_str)
-                        logger.info(f"Received command from {client_addr}: {message}")
+                        logger.debug(f"Received command from {client_addr}: {message}")
                         
                         # Process command
                         response = await self._process_command(message)
@@ -91,7 +92,7 @@ class MultiCamServer:
                     message_data = await reader.readexactly(message_length)
                     logger.debug(f"Raw message data: {message_data[:100]}... from {client_addr}")
                     message = json.loads(message_data.decode('utf-8'))
-                    logger.info(f"Received command from {client_addr}: {message}")
+                    logger.debug(f"Received command from {client_addr}: {message}")
                     
                     # Process command
                     response = await self._process_command(message)
@@ -128,7 +129,7 @@ class MultiCamServer:
         try:
             # Parse command using CommandMessage
             cmd = CommandMessage.from_json(json.dumps(message))
-            logger.info(f"Processing command: {cmd.command}")
+            logger.debug(f"Processing command: {cmd.command}")
 
             if cmd.command == CommandType.START_RECORDING:
                 logger.info(f"START_RECORDING command with timestamp: {cmd.timestamp}")
@@ -212,17 +213,46 @@ class MultiCamServer:
 
             elif cmd.command == CommandType.UPLOAD_TO_CLOUD:
                 logger.info(f"UPLOAD_TO_CLOUD command for fileName: {cmd.fileName}")
-                if not cmd.fileName or not cmd.uploadUrl:
+                if not cmd.fileName:
                     error = ErrorResponse(
                         deviceId=self.device.device_id,
                         status=DeviceStatus.ERROR.value,
                         timestamp=time.time(),
-                        message="fileName and uploadUrl required for UPLOAD_TO_CLOUD"
+                        message="fileName required for UPLOAD_TO_CLOUD"
                     )
                     return json.loads(error.to_json())
 
-                # Call actual implementation
-                response = await self.device.upload_to_cloud(cmd.fileName, cmd.uploadUrl)
+                # Check if using IAM credentials or presigned URL
+                if (cmd.s3Bucket and cmd.s3Key and cmd.awsAccessKeyId and
+                    cmd.awsSecretAccessKey and cmd.awsSessionToken and cmd.awsRegion):
+                    # Use IAM credentials authentication
+                    logger.info(f"Using IAM credentials for upload: {cmd.fileName}")
+                    response = await self.device.upload_to_cloud(
+                        file_name=cmd.fileName,
+                        upload_url=None,
+                        s3_bucket=cmd.s3Bucket,
+                        s3_key=cmd.s3Key,
+                        access_key_id=cmd.awsAccessKeyId,
+                        secret_access_key=cmd.awsSecretAccessKey,
+                        session_token=cmd.awsSessionToken,
+                        region=cmd.awsRegion
+                    )
+                elif cmd.uploadUrl:
+                    # Use presigned URL authentication
+                    logger.info(f"Using presigned URL for upload: {cmd.fileName}")
+                    response = await self.device.upload_to_cloud(
+                        file_name=cmd.fileName,
+                        upload_url=cmd.uploadUrl
+                    )
+                else:
+                    error = ErrorResponse(
+                        deviceId=self.device.device_id,
+                        status=DeviceStatus.ERROR.value,
+                        timestamp=time.time(),
+                        message="Missing authentication credentials (uploadUrl or IAM credentials) for UPLOAD_TO_CLOUD"
+                    )
+                    return json.loads(error.to_json())
+
                 return json.loads(response.to_json())
 
             else:
