@@ -7,7 +7,7 @@ import struct
 import time
 from typing import Any, Dict
 
-from multicam_common.status import DeviceStatus
+from multicam_common.status import DeviceStatus, DeviceType
 from multicam_common.commands import (
     CommandMessage, CommandType, StatusResponse,
     StopRecordingResponse, ErrorResponse, FileResponse,
@@ -151,7 +151,8 @@ class MultiCamServer:
                 response = StatusResponse(
                     deviceId=self.device.device_id,
                     status=DeviceStatus.COMMAND_RECEIVED.value,
-                    timestamp=time.time()
+                    timestamp=time.time(),
+                    deviceType=DeviceType.OAK.value
                 )
                 return json.loads(response.to_json())
 

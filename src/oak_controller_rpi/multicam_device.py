@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, Optional, Any, List, Union
 
 from zeroconf import ServiceInfo, Zeroconf
-from multicam_common.status import DeviceStatus
+from multicam_common.status import DeviceStatus, DeviceType
 from multicam_common.commands import (
     CommandType, CommandMessage, StatusResponse,
     StopRecordingResponse, ErrorResponse, FileResponse,
@@ -119,6 +119,7 @@ class MultiCamDevice:
                 status=DeviceStatus.RECORDING.value,
                 timestamp=time.time(),
                 batteryLevel=self._get_battery_level(),
+                deviceType=DeviceType.OAK.value,
                 uploadQueue=self.upload_queue,
                 failedUploadQueue=self.failed_upload_queue
             )
@@ -142,6 +143,7 @@ class MultiCamDevice:
                 status=DeviceStatus.SCHEDULED_RECORDING_ACCEPTED.value,
                 timestamp=time.time(),
                 batteryLevel=self._get_battery_level(),
+                deviceType=DeviceType.OAK.value,
                 uploadQueue=self.upload_queue,
                 failedUploadQueue=self.failed_upload_queue
             )
@@ -154,6 +156,7 @@ class MultiCamDevice:
                 status=DeviceStatus.COMMAND_RECEIVED.value,
                 timestamp=time.time(),
                 batteryLevel=self._get_battery_level(),
+                deviceType=DeviceType.OAK.value,
                 uploadQueue=self.upload_queue,
                 failedUploadQueue=self.failed_upload_queue
             )
@@ -466,6 +469,7 @@ class MultiCamDevice:
             status=self.status,
             timestamp=time.time(),
             batteryLevel=self._get_battery_level(),
+            deviceType=DeviceType.OAK.value,
             uploadQueue=self.upload_queue,
             failedUploadQueue=self.failed_upload_queue
         )
@@ -592,6 +596,7 @@ class MultiCamDevice:
             status=DeviceStatus.UPLOAD_QUEUED.value,
             timestamp=time.time(),
             batteryLevel=self._get_battery_level(),
+            deviceType=DeviceType.OAK.value,
             uploadQueue=self.upload_queue,
             failedUploadQueue=self.failed_upload_queue
         )
