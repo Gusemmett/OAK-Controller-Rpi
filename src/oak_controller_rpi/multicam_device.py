@@ -358,18 +358,16 @@ class MultiCamDevice:
             success = self.native_recorder.stop_recording()
             if not success:
                 logger.error("Failed to stop native recorder")
-            
-            # Create ZIP archive of recorded data
-            logger.info("Starting video finalization process - creating ZIP archive")
-            await self._finalize_recording()
+
+            # Defer finalization (MP4 conversion, stats, and ZIP creation) until video is accessed
+            logger.info("Video finalization deferred until UPLOAD or GET_VIDEO command")
 
             self.is_recording = False
             self.status = DeviceStatus.READY.value
             logger.info(f"Recording stopped successfully. File name: {self.current_file_name}")
 
-            # Get file size
-            file_path = self.videos_dir / self.current_file_name
-            file_size = file_path.stat().st_size if file_path.exists() else 0
+            # File size is 0 since ZIP doesn't exist yet
+            file_size = 0
 
             response = StopRecordingResponse(
                 deviceId=self.device_id,
@@ -402,13 +400,18 @@ class MultiCamDevice:
                 message=error_msg
             )
     
-    async def _finalize_recording(self):
-        """Run stereo post-processing (MP4 + stats) and zip results."""
-        if not self.current_file_name:
-            logger.warning("No current file name for finalization")
+    async def _finalize_recording(self, file_name: Optional[str] = None):
+        """Run stereo post-processing (MP4 + stats) and zip results.
+
+        Args:
+            file_name: Optional file name to finalize. If not provided, uses self.current_file_name.
+        """
+        target_file_name = file_name or self.current_file_name
+        if not target_file_name:
+            logger.warning("No file name provided for finalization")
             return
 
-        output_dir = self.videos_dir / Path(self.current_file_name).stem
+        output_dir = self.videos_dir / Path(target_file_name).stem
         if not output_dir.exists():
             logger.error(f"Output directory does not exist: {output_dir}")
             return
@@ -461,7 +464,47 @@ class MultiCamDevice:
             logger.info(f"Finalized recording. ZIP: {zip_path} ({sz_mb:.1f} MB)")
         else:
             logger.error("Finalization did not produce a ZIP archive")
-    
+
+    async def _ensure_video_finalized(self, file_name: str) -> bool:
+        """Ensure video is finalized (ZIP exists). If not, run finalization.
+
+        Args:
+            file_name: Name of the ZIP file to ensure exists (e.g., 'video_123.zip')
+
+        Returns:
+            True if ZIP exists or was successfully created, False otherwise
+        """
+        zip_path = self.videos_dir / file_name
+
+        # If ZIP already exists, we're done
+        if zip_path.exists():
+            logger.debug(f"ZIP already exists: {file_name}")
+            return True
+
+        # Check if source directory exists
+        output_dir = self.videos_dir / Path(file_name).stem
+        if not output_dir.exists():
+            logger.error(f"Cannot finalize {file_name}: output directory does not exist: {output_dir}")
+            return False
+
+        # Run finalization to create ZIP
+        logger.info(f"ZIP does not exist, running finalization for: {file_name}")
+        try:
+            await self._finalize_recording(file_name)
+
+            # Verify ZIP was created
+            if zip_path.exists():
+                logger.info(f"Finalization successful: {file_name}")
+                return True
+            else:
+                logger.error(f"Finalization completed but ZIP not found: {file_name}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error during finalization of {file_name}: {e}")
+            logger.exception("Full exception details:")
+            return False
+
     def get_device_status(self) -> StatusResponse:
         """Get current device status"""
         return StatusResponse(
@@ -516,6 +559,18 @@ class MultiCamDevice:
                 status=DeviceStatus.ERROR.value,
                 timestamp=time.time(),
                 message="Missing authentication credentials (uploadUrl or IAM credentials)"
+            )
+
+        # Ensure video is finalized (creates ZIP if needed)
+        logger.info(f"Ensuring video is finalized before upload: {file_name}")
+        finalized = await self._ensure_video_finalized(file_name)
+        if not finalized:
+            logger.error(f"Failed to finalize video before upload: {file_name}")
+            return ErrorResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.ERROR.value,
+                timestamp=time.time(),
+                message=f"Failed to finalize video: {file_name}"
             )
 
         # Validate file exists

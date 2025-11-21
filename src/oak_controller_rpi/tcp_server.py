@@ -167,6 +167,19 @@ class MultiCamServer:
                     )
                     return json.loads(error.to_json())
 
+                # Ensure video is finalized (creates ZIP if needed)
+                logger.info(f"Ensuring video is finalized before GET_VIDEO: {cmd.fileName}")
+                finalized = await self.device._ensure_video_finalized(cmd.fileName)
+                if not finalized:
+                    logger.error(f"Failed to finalize video for GET_VIDEO: {cmd.fileName}")
+                    error = ErrorResponse(
+                        deviceId=self.device.device_id,
+                        status=DeviceStatus.ERROR.value,
+                        timestamp=time.time(),
+                        message=f"Failed to finalize video: {cmd.fileName}"
+                    )
+                    return json.loads(error.to_json())
+
                 file_metadata = self.device.get_video_info(cmd.fileName)
                 if not file_metadata:
                     logger.warning(f"Video file not found: {cmd.fileName}")
