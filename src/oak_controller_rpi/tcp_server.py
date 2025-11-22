@@ -70,10 +70,17 @@ class MultiCamServer:
                             header_json = json.dumps(header).encode('utf-8')
                             header_length = struct.pack('>I', len(header_json))
                             logger.info(f"Sending binary file to {client_addr}: {len(file_data)} bytes")
-                            
+
                             # Send header length + header + file data (keep this format for files)
                             writer.write(header_length + header_json + file_data)
                             await writer.drain()
+
+                            # Clean up file after successful GET_VIDEO
+                            if message.get('command') == 'GET_VIDEO':
+                                file_name = message.get('fileName')
+                                if file_name:
+                                    logger.info(f"Deleting file after successful GET_VIDEO: {file_name}")
+                                    await self.device._delete_uploaded_file(file_name)
                     except json.JSONDecodeError as e:
                         logger.error(f"Failed to parse JSON from {client_addr}: {e}")
                         break
@@ -110,10 +117,17 @@ class MultiCamServer:
                         header_json = json.dumps(header).encode('utf-8')
                         header_length = struct.pack('>I', len(header_json))
                         logger.info(f"Sending binary file to {client_addr}: {len(file_data)} bytes")
-                        
+
                         # Send header length + header + file data
                         writer.write(header_length + header_json + file_data)
                         await writer.drain()
+
+                        # Clean up file after successful GET_VIDEO
+                        if message.get('command') == 'GET_VIDEO':
+                            file_name = message.get('fileName')
+                            if file_name:
+                                logger.info(f"Deleting file after successful GET_VIDEO: {file_name}")
+                                await self.device._delete_uploaded_file(file_name)
         
         except asyncio.IncompleteReadError:
             logger.info(f"Client disconnected: {client_addr}")
