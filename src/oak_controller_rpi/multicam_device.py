@@ -840,7 +840,6 @@ class MultiCamDevice:
         from boto3.s3.transfer import TransferConfig
         from botocore.exceptions import ClientError
 
-        start_time = time.time()
         bucket = credentials['bucket']
         key = credentials['key']
         region = credentials['region']
@@ -859,81 +858,107 @@ class MultiCamDevice:
         # Get event loop reference for use in callback
         loop = asyncio.get_running_loop()
 
-        # Progress callback for boto3
-        bytes_uploaded_total = [0]  # Use list to allow modification in nested function
+        # Retry configuration
+        max_retries = 3
+        retry_delays = [5, 10, 20]  # Exponential backoff: 5s, 10s, 20s
+        last_exception = None
 
-        def progress_callback(bytes_uploaded_chunk):
-            """Called by boto3 for each chunk uploaded"""
-            bytes_uploaded_total[0] += bytes_uploaded_chunk
-            elapsed = time.time() - start_time
+        for attempt in range(max_retries):
+            start_time = time.time()
 
-            # Schedule async update in event loop from thread
-            asyncio.run_coroutine_threadsafe(
-                self._update_upload_progress(
-                    upload_item.fileName,
-                    bytes_uploaded_total[0],
-                    elapsed
-                ),
-                loop
-            )
+            # Progress callback for boto3 - reset for each attempt
+            bytes_uploaded_total = [0]  # Use list to allow modification in nested function
 
-        try:
-            # Create S3 client with temporary credentials
-            logger.debug(f"Creating S3 client with IAM credentials")
-            s3_client = boto3.client(
-                's3',
-                aws_access_key_id=credentials['access_key_id'],
-                aws_secret_access_key=credentials['secret_access_key'],
-                aws_session_token=credentials['session_token'],
-                region_name=region
-            )
+            def progress_callback(bytes_uploaded_chunk):
+                """Called by boto3 for each chunk uploaded"""
+                bytes_uploaded_total[0] += bytes_uploaded_chunk
+                elapsed = time.time() - start_time
 
-            # Execute upload in thread pool to avoid blocking async event loop
-            # boto3 is synchronous, so we run it in an executor
-            logger.debug(f"Starting boto3 upload (multipart threshold: 8MB)")
-            await loop.run_in_executor(
-                None,  # Use default thread pool
-                lambda: s3_client.upload_file(
-                    str(file_path),
-                    bucket,
-                    key,
-                    Config=config,
-                    Callback=progress_callback
+                # Schedule async update in event loop from thread
+                asyncio.run_coroutine_threadsafe(
+                    self._update_upload_progress(
+                        upload_item.fileName,
+                        bytes_uploaded_total[0],
+                        elapsed
+                    ),
+                    loop
                 )
-            )
 
-            logger.info(f"S3 IAM upload successful: {file_path.name}")
+            try:
+                if attempt > 0:
+                    logger.info(f"Retry attempt {attempt + 1}/{max_retries} for {file_path.name}")
 
-            # Final progress update
-            elapsed = time.time() - start_time
-            await self._update_upload_progress(
-                upload_item.fileName,
-                upload_item.fileSize,
-                elapsed
-            )
+                # Create S3 client with temporary credentials
+                logger.debug(f"Creating S3 client with IAM credentials")
+                s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=credentials['access_key_id'],
+                    aws_secret_access_key=credentials['secret_access_key'],
+                    aws_session_token=credentials['session_token'],
+                    region_name=region
+                )
 
-            # Log final statistics
-            avg_speed = upload_item.fileSize / elapsed if elapsed > 0 else 0
-            logger.info(f"Upload stats: {upload_item.fileSize} bytes in {elapsed:.2f}s "
-                       f"(avg speed: {avg_speed / 1024 / 1024:.2f} MB/s)")
+                # Execute upload in thread pool to avoid blocking async event loop
+                # boto3 is synchronous, so we run it in an executor
+                logger.debug(f"Starting boto3 upload (multipart threshold: 8MB)")
+                await loop.run_in_executor(
+                    None,  # Use default thread pool
+                    lambda: s3_client.upload_file(
+                        str(file_path),
+                        bucket,
+                        key,
+                        Config=config,
+                        Callback=progress_callback
+                    )
+                )
 
-            # Check if multipart was used
-            if upload_item.fileSize > config.multipart_threshold:
-                num_parts = (upload_item.fileSize + config.multipart_chunksize - 1) // config.multipart_chunksize
-                logger.info(f"Multipart upload used: {num_parts} parts of {config.multipart_chunksize / 1024 / 1024:.1f} MB each")
+                logger.info(f"S3 IAM upload successful: {file_path.name}")
 
-        except ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            error_msg = f"AWS S3 error ({error_code}): {str(e)}"
-            logger.error(error_msg)
-            raise Exception(error_msg)
-        except FileNotFoundError:
-            error_msg = f"File deleted during upload: {file_path}"
-            logger.error(error_msg)
-            raise Exception(error_msg)
-        except Exception as e:
-            logger.error(f"Unexpected error during IAM upload: {e}")
-            raise
+                # Final progress update
+                elapsed = time.time() - start_time
+                await self._update_upload_progress(
+                    upload_item.fileName,
+                    upload_item.fileSize,
+                    elapsed
+                )
+
+                # Log final statistics
+                avg_speed = upload_item.fileSize / elapsed if elapsed > 0 else 0
+                logger.info(f"Upload stats: {upload_item.fileSize} bytes in {elapsed:.2f}s "
+                           f"(avg speed: {avg_speed / 1024 / 1024:.2f} MB/s)")
+
+                # Check if multipart was used
+                if upload_item.fileSize > config.multipart_threshold:
+                    num_parts = (upload_item.fileSize + config.multipart_chunksize - 1) // config.multipart_chunksize
+                    logger.info(f"Multipart upload used: {num_parts} parts of {config.multipart_chunksize / 1024 / 1024:.1f} MB each")
+
+                # Success - exit retry loop
+                return
+
+            except FileNotFoundError:
+                # Don't retry if file is missing - it won't come back
+                error_msg = f"File deleted during upload: {file_path}"
+                logger.error(error_msg)
+                raise Exception(error_msg)
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                error_msg = f"AWS S3 error ({error_code}): {str(e)}"
+                logger.error(f"Attempt {attempt + 1}/{max_retries} failed: {error_msg}")
+                last_exception = Exception(error_msg)
+            except Exception as e:
+                error_msg = f"Unexpected error during IAM upload: {e}"
+                logger.error(f"Attempt {attempt + 1}/{max_retries} failed: {error_msg}")
+                last_exception = e
+
+            # Wait before retrying (unless this was the last attempt)
+            if attempt < max_retries - 1:
+                delay = retry_delays[attempt]
+                logger.info(f"Waiting {delay}s before retry...")
+                await asyncio.sleep(delay)
+
+        # All retries exhausted
+        logger.error(f"All {max_retries} upload attempts failed for {file_path.name}")
+        raise last_exception
 
     async def _update_upload_progress(self, file_name: str, bytes_uploaded: int, elapsed: float) -> None:
         """Update UploadItem progress fields (thread-safe)"""
