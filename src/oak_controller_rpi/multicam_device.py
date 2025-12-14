@@ -21,6 +21,7 @@ from multicam_common.constants import TCP_PORT
 
 from .native_recorder import NativeOAKRecorder, RecorderState
 from .post_process import StereoPostProcess
+from .camera_detector import get_primary_oak_device
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,12 @@ class MultiCamDevice:
         self.current_file_name: Optional[str] = None
         self.native_recorder: Optional[NativeOAKRecorder] = None
         self.status = DeviceStatus.READY.value
+
+        # Camera detection
+        self.camera_connected = False
+        self._camera_check_interval = 5.0  # seconds
+        self._camera_check_task: Optional[asyncio.Task] = None
+        self._last_camera_mxid: Optional[str] = None
 
         # Upload queue infrastructure
         self.upload_queue: List[UploadItem] = []
@@ -64,8 +71,18 @@ class MultiCamDevice:
 
     async def start_mdns(self):
         """Start mDNS service advertisement"""
+        # Check camera connection before starting mDNS
+        await self._check_camera_connection()
+
+        if not self.camera_connected:
+            logger.warning("Starting mDNS with camera disconnected status")
+            self.status = DeviceStatus.CAMERA_DISCONNECTED.value
+
+        # Start periodic camera monitoring
+        self._camera_check_task = asyncio.create_task(self._camera_monitor_loop())
+
         service_name = f"multiCam-oak-{self.device_id}._multicam._tcp.local."
-        
+
         # Get local IP address - connect to external address to determine local interface
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -96,6 +113,15 @@ class MultiCamDevice:
     
     async def stop_mdns(self):
         """Stop mDNS service advertisement"""
+        # Stop camera monitoring
+        if self._camera_check_task:
+            self._camera_check_task.cancel()
+            try:
+                await self._camera_check_task
+            except asyncio.CancelledError:
+                pass
+            self._camera_check_task = None
+
         if self.service_info:
             await self.zeroconf.async_unregister_service(self.service_info)
             self.service_info = None
@@ -107,6 +133,54 @@ class MultiCamDevice:
         # For RPi with UPS, read from I2C/GPIO
         # For now, return None
         return None
+
+    async def _check_camera_connection(self) -> bool:
+        """
+        Check if OAK camera is connected and update status accordingly.
+
+        Returns:
+            True if camera is connected, False otherwise.
+        """
+        was_connected = self.camera_connected
+
+        # Run detection in executor to avoid blocking async loop
+        loop = asyncio.get_event_loop()
+        device_info = await loop.run_in_executor(None, get_primary_oak_device)
+
+        self.camera_connected = device_info is not None
+
+        if self.camera_connected:
+            self._last_camera_mxid = device_info.mxid
+
+            # Only update status if we were previously disconnected and not recording
+            if not was_connected and not self.is_recording:
+                logger.info(f"OAK camera connected: {device_info.mxid}")
+                self.status = DeviceStatus.READY.value
+        else:
+            self._last_camera_mxid = None
+
+            # Only update status if we were previously connected or status is READY
+            if was_connected or self.status == DeviceStatus.READY.value:
+                logger.warning("OAK camera disconnected")
+                if not self.is_recording:
+                    self.status = DeviceStatus.CAMERA_DISCONNECTED.value
+
+        return self.camera_connected
+
+    async def _camera_monitor_loop(self):
+        """Background task to periodically check camera connection."""
+        logger.info(f"Starting camera monitor (interval: {self._camera_check_interval}s)")
+
+        while True:
+            try:
+                await self._check_camera_connection()
+                await asyncio.sleep(self._camera_check_interval)
+            except asyncio.CancelledError:
+                logger.info("Camera monitor stopped")
+                break
+            except Exception as e:
+                logger.error(f"Error in camera monitor: {e}")
+                await asyncio.sleep(self._camera_check_interval)
 
     async def start_recording(self, scheduled_time: Optional[float] = None) -> StatusResponse:
         """Start recording, optionally at scheduled time"""
@@ -123,7 +197,20 @@ class MultiCamDevice:
                 uploadQueue=self.upload_queue,
                 failedUploadQueue=self.failed_upload_queue
             )
-        
+
+        # Check camera connection before attempting to record
+        if not await self._check_camera_connection():
+            logger.error("Cannot start recording: OAK camera not connected")
+            return StatusResponse(
+                deviceId=self.device_id,
+                status=DeviceStatus.CAMERA_DISCONNECTED.value,
+                timestamp=time.time(),
+                batteryLevel=self._get_battery_level(),
+                deviceType=DeviceType.OAK.value,
+                uploadQueue=self.upload_queue,
+                failedUploadQueue=self.failed_upload_queue
+            )
+
         current_time = time.time()
         logger.info(f"Current time: {current_time}, Scheduled time: {scheduled_time}")
         
