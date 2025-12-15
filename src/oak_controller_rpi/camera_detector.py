@@ -34,12 +34,13 @@ def detect_oak_cameras() -> List[OAKDeviceInfo]:
         Empty list if no cameras found or on error.
     """
     try:
-        devices = dai.Device.getAllAvailableDevices()
+        # Use DeviceBootloader to query devices without booting them
+        devices = dai.DeviceBootloader.getAllAvailableDevices()
         result = []
 
         for device_info in devices:
             oak_info = OAKDeviceInfo(
-                mxid=device_info.getMxId(),
+                mxid=device_info.deviceId,  # depthai 3.0 uses deviceId instead of mxid
                 state=str(device_info.state),
                 name=getattr(device_info, 'name', None)
             )
