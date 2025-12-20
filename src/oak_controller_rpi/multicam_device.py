@@ -761,10 +761,9 @@ class MultiCamDevice:
                 logger.error(f"Upload item not found in queue: {file_name}")
                 return
 
-            # Update status to UPLOADING
+            # Update upload item status to UPLOADING
             async with self._upload_lock:
                 upload_item.status = UploadStatus.UPLOADING.value
-                self.status = DeviceStatus.UPLOADING.value
 
             logger.info(f"Starting upload: {file_name}")
 
